@@ -267,7 +267,8 @@ fn imported_high_ids_remain_retired_without_schema_changes() {
     .expect("import file");
     let removed = planning::remove_action(imported_path.to_str().expect("Unicode"), 1000)
         .expect("remove high ID");
-    assert!(removed.actions.is_empty() && removed.revision > 1000);
+    assert_eq!(removed.actions, [] as [MoveAction; 0]);
+    assert!(removed.revision > 1000);
     let added = planning::add_move(
         imported_path.to_str().expect("Unicode"),
         MoveRequest {

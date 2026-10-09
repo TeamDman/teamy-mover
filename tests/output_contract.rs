@@ -83,8 +83,9 @@ fn malformed_and_unsupported_input_fail_with_stderr_and_no_json_stdout() {
             .output()
             .expect("invalid plan subprocess");
         assert!(!output.status.success());
-        assert!(
-            output.stdout.is_empty(),
+        assert_eq!(
+            output.stdout,
+            [] as [u8; 0],
             "an unrecoverable error must not emit a partial result"
         );
         assert!(

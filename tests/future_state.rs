@@ -156,10 +156,10 @@ fn ambiguous_and_device_namespace_action_paths_are_rejected() {
             "accepted {source}"
         );
     }
-    assert!(
+    assert_eq!(
         planning::read_plan_input(&fixture.plan())
             .expect("plan")
-            .actions
-            .is_empty()
+            .actions,
+        [] as [teamy_mover::planning::MoveAction; 0]
     );
 }
