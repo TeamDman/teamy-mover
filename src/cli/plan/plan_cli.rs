@@ -34,17 +34,13 @@ pub enum PlanCommand {
 impl PlanArgs {
     /// # Errors
     /// Returns an error if the requested plan command fails.
-    #[expect(
-        clippy::unused_async,
-        reason = "template command dispatch uses async invoke methods"
-    )]
-    pub async fn invoke(self) -> eyre::Result<CliOutput> {
-        match self.command {
+    pub fn invoke(self) -> std::future::Ready<eyre::Result<CliOutput>> {
+        std::future::ready(match self.command {
             PlanCommand::Create(args) => args.invoke(),
             PlanCommand::Action(args) => args.invoke(),
             PlanCommand::List(args) => args.invoke(),
             PlanCommand::Show(args) => args.invoke(),
             PlanCommand::DryRun(args) => args.invoke(),
-        }
+        })
     }
 }

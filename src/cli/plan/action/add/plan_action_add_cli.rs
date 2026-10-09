@@ -36,9 +36,11 @@ impl PlanActionAddArgs {
                 reason,
             },
             (None, None, None, Some(input)) => planning::read_request(&input)?,
-            _ => bail!(
-                "supply --source, --destination, and --reason together, or supply only --input"
-            ),
+            _ => {
+                bail!(
+                    "supply --source, --destination, and --reason together, or supply only --input"
+                );
+            }
         };
         let value = planning::add_move(&self.plan_file, request)?;
         let elapsed_duration_warn_threshold = if interactive {
