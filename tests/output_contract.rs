@@ -4,7 +4,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use teamy_mover::planning;
+
+static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct Fixture(PathBuf, PathBuf);
@@ -14,9 +18,10 @@ impl Fixture {
         let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures");
         fs::create_dir_all(&parent).expect("fixture parent");
         let root = parent.join(format!(
-            "output-{}-{}",
+            "output-{}-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).expect("new fixture");
         Self(
@@ -108,7 +113,7 @@ fn genuine_parse_errors_keep_useful_diagnostics_on_stderr() {
             .output()
             .expect("parser subprocess");
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, [] as [u8; 0]);
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(expected),
             "{}",

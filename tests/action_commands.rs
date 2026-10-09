@@ -240,7 +240,7 @@ fn invalid_ids_and_missing_selection_do_not_change_plan_or_history() {
         }
     }
     let removed: MovePlan = parse_success(&fixture.command("remove", &["--action-id", "1"]));
-    assert!(removed.actions.is_empty());
+    assert_eq!(removed.actions, [] as [MoveAction; 0]);
     let after_valid_removal = fixture.snapshot();
     assert!(
         !fixture
