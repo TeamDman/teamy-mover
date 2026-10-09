@@ -1,0 +1,7 @@
+/target
+/tracy/
+ignore
+*.tracy
+
+/.template-source-hashes.json
+/.local-plans/

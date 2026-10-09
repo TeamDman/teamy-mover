@@ -1,0 +1,5 @@
+{
+  "source": "sample/source.txt",
+  "destination": "sample/renamed.txt",
+  "reason": "Give this synthetic sample its intended name"
+}

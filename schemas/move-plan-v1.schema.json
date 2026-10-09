@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TeamDman/teamy-mover/schemas/move-plan-v1.schema.json",
+  "title": "Teamy Mover plan version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "plan_id", "revision", "name", "base_directory", "actions"],
+  "properties": {
+    "version": { "const": 1 },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "base_directory": { "type": "string", "minLength": 1, "description": "Absolute base path; checked by the planner" },
+    "policy_reference": { "type": ["string", "null"], "description": "Descriptive reference only; no permission enforcement" },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action_id", "operation", "source", "destination", "reason"],
+        "properties": {
+          "action_id": { "type": "integer", "minimum": 1, "description": "Unique within this plan" },
+          "operation": { "const": "move" },
+          "source": { "type": "string", "minLength": 1, "description": "Exact absolute path" },
+          "destination": { "type": "string", "minLength": 1, "description": "Exact absolute future path" },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
