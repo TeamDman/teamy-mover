@@ -249,7 +249,9 @@ fn action_path(base: &Path, raw: &str) -> Result<PathBuf> {
                 prefix.push("\\");
                 PathBuf::from(prefix)
             }
-            _ => bail!("device and non-filesystem Windows namespace paths are unsupported"),
+            _ => {
+                bail!("device and non-filesystem Windows namespace paths are unsupported");
+            }
         };
         for part in parts {
             if !matches!(part, Component::RootDir) {
@@ -613,7 +615,12 @@ fn observe(path: &Path, moves: &[SimulatedMove]) -> Result<Observation> {
     let mut depends_on = Vec::new();
     for movement in moves.iter().rev() {
         if let Some(tail) = strip_path_prefix(&physical, &movement.destination) {
-            physical = movement.source.join(tail);
+            // Joining an empty tail adds a trailing separator, invalid for files on Unix.
+            physical = if tail.as_os_str().is_empty() {
+                movement.source.clone()
+            } else {
+                movement.source.join(tail)
+            };
             depends_on.push(movement.id);
         } else if strip_path_prefix(&physical, &movement.source).is_some() {
             depends_on.push(movement.id);
