@@ -1154,7 +1154,11 @@ mod tests {
                 let replay_control = replay.clone();
                 replay_control.begin(1, ID.into(), digest.clone()).await.unwrap();
                 assert!(matches!(replay_control.receipt(ID.into(), digest.clone()).await, Err(TransferError::NotReady)));
-                let (replay_left, replay_right) = tokio::io::duplex(128 * 1024);
+                let (replay_left, mut bridge_left) = tokio::io::duplex(128 * 1024);
+                let (replay_right, mut bridge_right) = tokio::io::duplex(128 * 1024);
+                let replay_bridge = tokio::spawn(async move {
+                    let _result = tokio::io::copy_bidirectional(&mut bridge_left, &mut bridge_right).await;
+                });
                 let (client_tls, server_tls) = tokio::join!(client.connect(replay_left), server.accept(replay_right));
                 let (client_conn, server_conn) = tokio::join!(
                     vox_transport::establish_client(client_tls.unwrap()), replay.establish(server_tls.unwrap())
@@ -1197,14 +1201,12 @@ mod tests {
                 let request_digest = digest.clone();
                 let pending = tokio::spawn(async move { request.receipt(ID.into(), request_digest).await });
                 started_rx.await.unwrap();
-                replay_client.shutdown().unwrap();
-                let closed_with_lane_open = tokio::time::timeout(Duration::from_millis(250), replay_server.closed()).await;
-                drop(lane);
-                if closed_with_lane_open.is_err() {
-                    tokio::time::timeout(Duration::from_secs(2), replay_server.closed()).await.unwrap();
-                }
+                replay_bridge.abort();
+                let _bridge_stopped = replay_bridge.await.unwrap_err();
+                tokio::time::timeout(Duration::from_secs(2), replay_server.closed()).await.unwrap();
                 let result = tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap().unwrap();
                 assert!(matches!(result, Err(TransferError::NotReady)));
+                drop(lane);
                 let _still_locked = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
                 release.send(()).unwrap();
                 let reopened = tokio::time::timeout(Duration::from_secs(2), async {

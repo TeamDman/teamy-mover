@@ -222,6 +222,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abrupt_transport_loss_closes_both_peers_with_service_lane_retained() {
+        let (client_io, mut bridge_left) = tokio::io::duplex(128 * 1024);
+        let (server_io, mut bridge_right) = tokio::io::duplex(128 * 1024);
+        let bridge = tokio::spawn(async move {
+            let _result = tokio::io::copy_bidirectional(&mut bridge_left, &mut bridge_right).await;
+        });
+        let (client, server) = tokio::join!(
+            initiate(client_io),
+            accept(server_io, EchoDispatcher::new(EchoService))
+        );
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let lane: EchoClient = client.open_lane().await.unwrap();
+        assert_eq!(
+            lane.echo("before loss".into()).await.unwrap(),
+            "before loss"
+        );
+        bridge.abort();
+        let _stopped = bridge.await.unwrap_err();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(client.closed(), server.closed());
+        })
+        .await
+        .expect("both peers must observe abrupt transport loss");
+        let _closed = lane.echo("after loss".into()).await.unwrap_err();
+    }
+
+    #[tokio::test]
     async fn receiver_rejects_peer_lane_with_excessive_limits() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let (client, server) = tokio::join!(
