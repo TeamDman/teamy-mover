@@ -7,6 +7,8 @@ pub mod blocking_io;
 pub mod journal;
 pub mod journal_file;
 pub mod manifest;
+#[cfg(target_os = "linux")]
+pub mod process_limit;
 pub mod proxy;
 #[cfg(windows)]
 pub mod receiver;
