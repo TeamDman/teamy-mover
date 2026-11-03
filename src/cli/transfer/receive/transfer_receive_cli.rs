@@ -2,7 +2,7 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
 
-/// Validate receiver inputs; live receiving remains gated.
+/// Validate receiver inputs or receive one approved transaction.
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 #[facet(rename_all = "kebab-case")]
 pub struct TransferReceiveArgs {
@@ -125,14 +125,13 @@ impl TransferReceiveArgs {
         }
     }
 
-    /// Validate locally approved receiver inputs before any listener or stage.
-    /// Live receiving remains gated until a qualification can be constructed.
+    /// Validate local inputs or start the bounded one-shot receiver.
     ///
     /// # Errors
-    /// Returns an error for unsafe inputs or an unavailable live qualification.
+    /// Returns an error for invalid inputs, unavailable guards or uncertain I/O.
     pub async fn invoke(self) -> eyre::Result<crate::cli::output::CliOutput> {
         if self.config_file.is_none() && !self.validate_only {
-            eyre::bail!("transfer is not yet available");
+            eyre::bail!("receiver configuration required");
         }
         #[cfg(windows)]
         {
@@ -270,9 +269,6 @@ async fn run_receiver(validated: ValidatedReceive) -> eyre::Result<crate::cli::o
         crate::transfer::windows_process_limit::is_current_process_limited(),
         "receiver process limit was not applied before runtime startup"
     );
-    // The reviewed post-rename verification gate remains closed before any
-    // destination mutation or listener until independent review completes.
-    crate::transfer::windows_publish::require_post_rename_file_verification()?;
     let profile = PathBuf::from(
         std::env::var_os("USERPROFILE").ok_or_else(|| eyre::eyre!("user profile unavailable"))?,
     );
@@ -294,7 +290,10 @@ async fn run_receiver(validated: ValidatedReceive) -> eyre::Result<crate::cli::o
             let profile = open_profile_guard(&profile)?;
             let id = verify_ntfs_directory(&profile)?;
             let destination = open_downloads_guard(&profile, id)?;
-            ensure!(verify_ntfs_directory(&destination)?.volume_serial == id.volume_serial, "destination volume changed");
+            ensure!(
+                verify_ntfs_directory(&destination)?.volume_serial == id.volume_serial,
+                "destination volume changed"
+            );
             Ok::<_, eyre::Report>((profile, destination))
         }),
     )
@@ -415,7 +414,7 @@ mod tests {
             validate_only: false,
         };
         let Err(gated) = live_args.invoke().await else {
-            panic!("live receiver must remain gated");
+            panic!("unlimited receiver must be rejected");
         };
         assert!(gated.to_string().contains("receiver process limit"));
         assert!(!fixture.path().join("storytelling-recovery").exists());

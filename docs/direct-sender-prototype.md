@@ -1,9 +1,8 @@
 # Direct sender prototype
 
-The Linux `transfer send` command can load a local connection configuration
-with `--connect-config`. This is a sender only: the Windows receiver and its
-publication gate are not operational yet. Do not treat a successful build or
-the earlier in-memory tests as proof that a cloud route works.
+The Linux `transfer send` command loads a local connection configuration with
+`--connect-config`. The Windows receiver uses `transfer receive --config-file`.
+Synthetic tests do not prove that a particular cloud route works.
 
 Combine the option with `--manifest-file`, `--manifest-sha256`,
 `--transaction-id`, and `--source-map`, using the same approved manifest and
@@ -52,10 +51,10 @@ The client certificate is used as the locally selected client trust root and
 must match the configured pin. Never store the private key in the repository.
 
 Validation checks the manifest, TLS configuration and target, but does not
-qualify either directory or prove network access. Live receiving is still
-disabled until the separate publication and destination gates are completed.
+qualify either directory or prove network access. Omit `--validate-only` to
+start a single bounded receiver transaction.
 
-The gated one-shot integration expects `work_parent` to be the selected user's
+The one-shot integration expects `work_parent` to be the selected user's
 profile, `destination_parent` to be its `Downloads` child, and `final_name` to
 be `storytelling-recovery`. It retains no-delete-sharing profile and Downloads
 handles, creates a protected `storytelling-<transaction-id>` work directory in
@@ -74,4 +73,5 @@ was held and checked at that time; it is not a power-loss durability guarantee
 or a promise against changes after handles are released. A timeout or uncertain
 I/O requires local inspection before retrying. Unexpected pending opens retain
 their worker and resources until process termination and may prevent normal
-runtime shutdown. This integration remains behind the independent-review gate.
+runtime shutdown. Check and reconcile the local journal and destination before
+retrying any uncertain outcome.

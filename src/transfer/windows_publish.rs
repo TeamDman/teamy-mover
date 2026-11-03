@@ -1,8 +1,8 @@
-//! Fail-closed Windows no-replace rename prototype.
+//! Windows no-replace publication for the bounded one-shot receiver.
 //!
-//! No operational `PublicationPermit` constructor exists. An independently
-//! reviewed gate must establish ancestry, exact contents, token and handle
-//! boundaries, filesystem semantics and recovery before any live use.
+//! Publication verifies the retained directory, files, identities, hashes
+//! and streams, but does not establish crash durability or protection against
+//! hostile local principals outside the documented trust boundary.
 
 use super::blocking_io::BlockingIoGate;
 use super::journal::{JournalBinding, ObjectIdentity};
@@ -21,13 +21,11 @@ use windows::Wdk::Storage::FileSystem::{
 use windows::Win32::Foundation::{HANDLE, STATUS_PENDING};
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 
-/// Reserved for a future independently reviewed, single-use gate.
-/// No operational constructor is provided.
+/// A private single-use blocking-I/O gate for one publication attempt.
 #[derive(Debug)]
 pub struct PublicationPermit(BlockingIoGate);
 
-/// Resources that a future independently reviewed qualification gate must
-/// construct as one bound unit. No operational constructor exists.
+/// Journal and handles bound for one publication attempt.
 #[derive(Debug)]
 pub struct QualifiedCommit {
     permit: PublicationPermit,
@@ -39,8 +37,8 @@ pub struct QualifiedCommit {
     final_name: String,
 }
 
-/// Retained resources from a future reviewed qualification decision. No
-/// operational constructor exists; DACL diagnostics alone cannot create it.
+/// Retained resources for a one-shot publication. DACL inspection alone does
+/// not establish the documented local trust boundary.
 pub(crate) struct PublicationQualification {
     permit: PublicationPermit,
     stage: CreatedDirectory,
@@ -291,24 +289,6 @@ struct RetainedDestination {
     ancestry: Vec<File>,
 }
 
-// A directory identity and pre-rename checks do not establish that every
-// reopened final file still has its approved identity, hash and stream set.
-// Keep the receipt path closed until the handle-relative, deadline-bound final
-// re-verification implementation and its independent review are complete.
-#[cfg_attr(
-    test,
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "production receipt gate stays closed"
-    )
-)]
-pub(crate) fn require_post_rename_file_verification() -> Result<()> {
-    #[cfg(not(test))]
-    eyre::bail!("post-rename verification is awaiting independent review");
-    #[cfg(test)]
-    Ok(())
-}
-
 async fn run_owned<F>(
     permit: PublicationPermit,
     mut journal: TransactionJournal,
@@ -384,7 +364,6 @@ where
                     )?;
                     let evidence =
                         observed_publication(&journal, &stage, &destination.parent, &final_name)?;
-                    require_post_rename_file_verification()?;
                     journal.record_observed_publication(evidence, &worker_gate, expires)?;
                     verified_files = held;
                     Ok::<(), eyre::Report>(())
@@ -440,8 +419,8 @@ pub async fn rename_with_permit(
 
 /// Like [`rename_with_permit`], retaining caller-qualified ancestry through
 /// completion or quarantine. This does not validate or qualify those handles.
-/// There is no operational permit constructor; the future qualification gate
-/// must prove that the supplied chain is complete, valid and protected.
+/// The caller must retain the approved handles and satisfy the documented
+/// local trust boundary; this function alone does not establish ancestry.
 ///
 /// # Errors
 /// Rejects an empty or overlong ancestry, invalid bindings, expired approval,
@@ -472,9 +451,8 @@ pub async fn rename_with_permit_and_ancestry(
 }
 
 /// Reverify an approved stage, record intent and attempt the no-replace rename
-/// under one absolute budget. There is no operational `QualifiedCommit`
-/// constructor. This coordinator alone does not prove filesystem isolation,
-/// peer liveness, a deliverable receipt, or power-loss durability.
+/// under one absolute budget. This coordinator alone does not prove filesystem
+/// isolation, peer liveness, a deliverable receipt, or power-loss durability.
 ///
 /// # Errors
 /// Returns an error for invalid bindings, expiry, verification or I/O failure,

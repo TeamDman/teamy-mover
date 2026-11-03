@@ -19,7 +19,7 @@ pub struct TransferArgs {
 pub enum TransferCommand {
     /// Verify or send locally approved Linux sources.
     Send(TransferSendArgs),
-    /// Validate receiver configuration; live receiving remains gated.
+    /// Validate configuration or receive one approved transaction.
     Receive(TransferReceiveArgs),
     /// Check a locally approved manifest without opening a connection.
     ValidateManifest(TransferValidateManifestArgs),

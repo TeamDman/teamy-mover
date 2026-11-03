@@ -1462,7 +1462,7 @@ impl LocalInspection {
         files: &mut BTreeMap<String, ExclusiveFile>,
         checkpoint: &impl Fn() -> Result<()>,
     ) -> Result<File> {
-        use super::windows_acl::open_checked_child;
+        use super::windows_acl::open_downloads_final;
         use super::windows_lock::FileIdentity;
         use super::windows_stage::{ExpectedEntry, verify_entries};
 
@@ -1491,7 +1491,7 @@ impl LocalInspection {
         super::windows_streams::verify_directory_streams(parent, actual_parent)?;
         let final_name = self.journal.binding.final_component().to_owned();
         checkpoint()?;
-        let final_directory = open_checked_child(parent, actual_parent, &final_name, false)?;
+        let final_directory = open_downloads_final(parent, actual_parent, &final_name)?;
         checkpoint()?;
         ensure!(
             self.intent_matches_directory(&final_directory)?,
@@ -1549,7 +1549,7 @@ impl LocalInspection {
         checkpoint()?;
         super::windows_streams::verify_directory_streams(parent, actual_parent)?;
         checkpoint()?;
-        let reopened = open_checked_child(parent, actual_parent, &final_name, false)?;
+        let reopened = open_downloads_final(parent, actual_parent, &final_name)?;
         checkpoint()?;
         ensure!(
             directory_identity(&reopened)? == stage_id,

@@ -1,4 +1,4 @@
-//! Version-one Vox transfer contract, with live operation still gated.
+//! Version-one Vox transfer contract for one approved transaction.
 //!
 //! An implementation must authenticate and bind every request to its locally
 //! approved transaction and manifest; use protected staging and durable
@@ -32,8 +32,7 @@ pub enum TransferState {
 }
 
 /// Remote operations for one previously approved version-one manifest.
-/// The receiver implementation has no operational qualification constructor
-/// or listener; synthetic tests exercise the commit path using a test permit.
+/// The receiver binds these requests to locally approved identities and pins.
 #[vox::service]
 pub trait TransferWire {
     async fn begin(

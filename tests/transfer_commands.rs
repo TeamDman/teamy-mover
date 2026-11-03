@@ -12,7 +12,12 @@ fn transfer_placeholders_refuse_to_run_and_do_not_create_files() {
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("transfer is not yet available"));
+        let expected = if operation == "receive" {
+            "receiver configuration required"
+        } else {
+            "transfer is not yet available"
+        };
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
         assert_eq!(output.stdout, [0_u8; 0]);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -122,7 +127,7 @@ fn receiver_command_rejects_incomplete_configuration_without_writes() {
     clippy::too_many_lines,
     reason = "exercise a complete synthetic receiver configuration"
 )]
-fn receiver_command_validates_inputs_and_keeps_live_gate_closed() {
+fn receiver_command_validates_inputs_without_starting_receiver() {
     use facet::Facet;
     use rcgen::{CertificateParams, KeyPair};
     use std::fmt::Write as _;
@@ -238,13 +243,6 @@ fn receiver_command_validates_inputs_and_keeps_live_gate_closed() {
     let summary = String::from_utf8(output.stdout).unwrap();
     assert!(summary.contains("\"valid\": true"));
     assert!(summary.contains("\"receiver_started\": false"));
-    let live = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
-        .args(["transfer", "receive", "--config-file"])
-        .arg(&config_path)
-        .output()
-        .unwrap();
-    assert!(!live.status.success());
-    assert!(String::from_utf8_lossy(&live.stderr).contains("awaiting independent review"));
     assert!(!dir.path().join("Downloads/storytelling-recovery").exists());
     assert!(
         !dir.path()

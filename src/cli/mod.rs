@@ -15,10 +15,9 @@ use figue::FigueBuiltins;
 use figue::{self as args};
 use teamy_cancellation::CancellationScope;
 
-/// Prepare reviewable move plans. Dry-run only reads filesystem metadata.
-///
-/// Creating or adding actions writes plan metadata. There is no command that
-/// executes a move, deletes a source, or creates a destination directory.
+/// Prepare reviewable move plans or transfer an explicitly approved file set.
+/// Planning dry-runs only read filesystem metadata; the one-shot receiver can
+/// create its approved destination and never deletes the sender's sources.
 #[derive(Facet, Arbitrary, Debug)]
 pub struct Cli {
     /// Global logging, cancellation, and output options.

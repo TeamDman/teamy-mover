@@ -1,9 +1,7 @@
-//! Journal-backed receiver with publication behind an unavailable live gate.
+//! Journal-backed one-shot receiver with bounded, authenticated publication.
 //!
-//! Operational construction is intentionally blocked: a `StagingPermit` cannot
-//! yet be created outside this module. Windows staging isolation and publication
-//! remain unresolved. The commit path is exercised only with a synthetic
-//! qualification; no listener or live permit constructor is implemented here.
+//! Local verification does not establish crash durability or protection from
+//! hostile local principals beyond the documented trust boundary.
 
 use super::blocking_io::BlockingIoGate;
 use super::journal::JournalApproval;
@@ -42,8 +40,7 @@ use tokio::sync::Mutex;
 const MAX_SESSION: Duration = Duration::from_mins(15);
 const MAX_IDLE: Duration = Duration::from_secs(30);
 
-/// Reserved for a future reviewed, platform-verified staging implementation.
-/// There is deliberately no public way to construct this permit.
+/// Internal capability used when preparing held staging files.
 #[derive(Debug)]
 pub struct StagingPermit(());
 
@@ -136,7 +133,7 @@ impl State {
     }
 }
 
-/// A one-connection receiver with no live staging or publication constructor.
+/// A one-connection receiver with an internally prepared stage and journal.
 #[derive(Clone)]
 pub struct Receiver {
     state: Arc<Mutex<State>>,
@@ -310,7 +307,7 @@ impl Receiver {
     /// Prepare pre-existing exclusively held files and journal their claims
     /// in a deadline-bounded blocking worker. After timeout or cancellation,
     /// the worker may still hold its handles and its on-disk outcome requires
-    /// inspection. This is unavailable until a reviewed staging permit exists.
+    /// inspection. The permit is constructed internally for the local stage.
     ///
     /// # Errors
     /// Rejects mismatched approval, missing files, unsafe claims and I/O errors.
@@ -323,8 +320,7 @@ impl Receiver {
         Self::prepare_inner(permit, journal, approval, files, None).await
     }
 
-    /// Prepare a receiver with a separately qualified publication capability.
-    /// No operational staging or publication constructor exists yet.
+    /// Prepare a receiver with a bound publication capability.
     pub(crate) async fn prepare_for_commit(
         permit: StagingPermit,
         journal: TransactionJournal,
@@ -783,7 +779,7 @@ impl TransferWire for Receiver {
         }
         state.in_flight_or_failed = false;
         // `closed()` reports observed closure, not instantaneous peer liveness.
-        // No real qualification can be constructed until this boundary is reviewed.
+        // A successful local write does not prove that the peer received it.
         if check(&state, &transaction_id, &manifest_sha256).is_err()
             || tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false }
         {

@@ -1,6 +1,4 @@
-//! Building blocks for the reviewed transfer design.
-//!
-//! No network listener, sender, receiver, or file execution is provided yet.
+//! Building blocks for bounded, explicitly approved file transfer.
 
 #[cfg(windows)]
 pub mod blocking_io;
