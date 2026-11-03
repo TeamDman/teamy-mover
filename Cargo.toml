@@ -23,7 +23,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 sha2 = "0.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-vox = { package = "teamy-vox", git = "https://github.com/TeamDman/vox.git", rev = "d567aa144d02d1da95bb191d49d22d2fc7cc1e75", default-features = false, features = ["runtime", "transport-tcp"] }
+vox = { package = "teamy-vox", git = "https://github.com/TeamDman/vox.git", rev = "c5b99b276d12a0ee48078ef1307e0a4f36ca9768", default-features = false, features = ["runtime", "transport-tcp"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
     "ansi",

@@ -375,14 +375,12 @@ async fn gate_probe(use_timer: bool) {
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "Vox d567aa14 stalls when a full channel mailbox receives close"]
 async fn incomplete_channel_closes_after_blocking_gate() {
     gate_probe(false).await;
 }
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "Vox d567aa14 stalls when a full channel mailbox receives close"]
 async fn incomplete_channel_closes_after_async_timer() {
     gate_probe(true).await;
 }

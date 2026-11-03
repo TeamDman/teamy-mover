@@ -1,7 +1,12 @@
 # Vox bounded channel liveness investigation
 
-This is a proposed repair and test plan, not an implemented or reviewed Vox
-change. The pinned Vox revision is `d567aa144d02d1da95bb191d49d22d2fc7cc1e75`.
+The driver-side repair was published in Vox revision
+`c5b99b276d12a0ee48078ef1307e0a4f36ca9768`, which Mover pins. It bounds
+pending writer schemas separately, enforces inbound item credit and preserves
+one ordered terminal message. The Mover deadlock regressions now run normally.
+The tests below remain a broader verification plan: raw/proxy lanes need their
+own corresponding limits, and this is not proof of a whole-process memory bound
+or of a working managed-proxy route.
 
 ## Reproduction
 
@@ -21,7 +26,7 @@ awaits the same bounded mailbox for a writer schema. The ordinary item enqueue
 can similarly block the driver if a peer sends beyond credit. Thus changing
 only close to an unbounded `force_send` is not a sufficient hostile-peer fix.
 
-## Candidate bounded design
+## Design and remaining limits
 
 The lane driver must never await space in a mailbox whose consumer is a handler
 polled by that driver. Use nonblocking enqueue, preserve FIFO order, and close
@@ -79,6 +84,4 @@ transport, not inferred from the Mover test.
 - Existing Vox core/stream/early-delivery suites plus the Mover regressions, and
   a real proxy/TLS route test separately before any operational transfer.
 
-Only after the repository-required Tracey tooling is available should the Vox
-spec and implementation be updated together. Mover reconnect and publication
-remain disabled independently of this proposed repair.
+Mover reconnect and publication remain disabled independently of this repair.
