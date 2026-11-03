@@ -11,8 +11,16 @@ use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::ServerName;
 use sha2::Digest;
 use sha2::Sha256;
+use teamy_mover::transfer::manifest::parse_approved_manifest;
+use teamy_mover::transfer::session::BodySetVerifier;
 use teamy_mover::transfer::tls::ClientEndpoint;
 use teamy_mover::transfer::tls::ServerEndpoint;
+use teamy_mover::transfer::vox_transport;
+use teamy_mover::transfer::wire::TransferError;
+use teamy_mover::transfer::wire::TransferState;
+use teamy_mover::transfer::wire::TransferWire;
+use teamy_mover::transfer::wire::TransferWireClient;
+use teamy_mover::transfer::wire::TransferWireDispatcher;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
@@ -227,4 +235,220 @@ async fn rejects_a_client_without_a_certificate() {
         server.accept(right)
     );
     let _error = server_result.unwrap_err();
+}
+
+#[vox::service]
+trait SyntheticEcho {
+    async fn echo(&self, value: String) -> String;
+}
+
+#[derive(Clone)]
+struct SyntheticEchoService;
+
+impl SyntheticEcho for SyntheticEchoService {
+    async fn echo(&self, value: String) -> String {
+        value
+    }
+}
+
+#[tokio::test]
+async fn bounded_vox_exchanges_synthetic_rpc_over_mutual_tls() {
+    let (client, server) = endpoints(
+        fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+        "100.64.0.1",
+        false,
+        false,
+    );
+    let (left, right) = tokio::io::duplex(128 * 1024);
+    let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+    let (client_vox, server_vox) = tokio::join!(
+        vox_transport::establish_client(client_tls.unwrap()),
+        vox_transport::establish_server(
+            server_tls.unwrap(),
+            SyntheticEchoDispatcher::new(SyntheticEchoService)
+        )
+    );
+    let client_vox = client_vox.unwrap();
+    let _server_vox = server_vox.unwrap();
+    let lane: SyntheticEchoClient = client_vox.open_lane().await.unwrap();
+    assert_eq!(lane.echo("synthetic".into()).await.unwrap(), "synthetic");
+}
+
+const TRANSACTION_ID: &str = "0123456789abcdef0123456789abcdef";
+
+struct MemoryTransferState {
+    began: bool,
+    bodies: BodySetVerifier<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct MemoryTransfer {
+    manifest_digest: String,
+    state: std::sync::Arc<tokio::sync::Mutex<MemoryTransferState>>,
+}
+
+impl MemoryTransfer {
+    fn new() -> Self {
+        let first = format!("{:x}", Sha256::digest(b"hello"));
+        let second = format!("{:x}", Sha256::digest(b"world"));
+        let raw = format!(
+            r#"{{"aggregate_bytes":10,"expires_unix":100,"file_count":2,"files":[{{"id":"one","name":"a.bin","sha256":"{first}","size":5}},{{"id":"two","name":"b.bin","sha256":"{second}","size":5}}],"transaction_id":"{TRANSACTION_ID}","version":1}}"#
+        );
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        let manifest = parse_approved_manifest(raw.as_bytes(), &digest, TRANSACTION_ID, 1).unwrap();
+        Self {
+            manifest_digest: digest,
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(MemoryTransferState {
+                began: false,
+                bodies: BodySetVerifier::new(manifest, 1).unwrap(),
+            })),
+        }
+    }
+
+    fn matches(&self, transaction_id: &str, manifest_sha256: &str) -> bool {
+        transaction_id == TRANSACTION_ID && manifest_sha256 == self.manifest_digest
+    }
+}
+
+impl TransferWire for MemoryTransfer {
+    async fn begin(
+        &self,
+        version: u32,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> Result<(), TransferError> {
+        if version != 1 || !self.matches(&transaction_id, &manifest_sha256) {
+            return Err(TransferError::Rejected);
+        }
+        let mut state = self.state.lock().await;
+        if state.began {
+            return Err(TransferError::Rejected);
+        }
+        state.began = true;
+        Ok(())
+    }
+
+    async fn upload(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+        file_id: String,
+        mut chunks: vox::Rx<Vec<u8>>,
+    ) -> Result<(), TransferError> {
+        if !self.matches(&transaction_id, &manifest_sha256) {
+            return Err(TransferError::Rejected);
+        }
+        let mut state = self.state.lock().await;
+        if !state.began {
+            return Err(TransferError::NotReady);
+        }
+        state
+            .bodies
+            .begin(&file_id, Vec::new(), 1)
+            .map_err(|_error| TransferError::Rejected)?;
+        while let Some(chunk) = chunks
+            .recv()
+            .await
+            .map_err(|_error| TransferError::Failed)?
+        {
+            state
+                .bodies
+                .push(chunk.get(), 1)
+                .map_err(|_error| TransferError::Rejected)?;
+        }
+        let _output = state
+            .bodies
+            .finish(1)
+            .map_err(|_error| TransferError::Rejected)?;
+        Ok(())
+    }
+
+    async fn status(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> Result<TransferState, TransferError> {
+        if !self.matches(&transaction_id, &manifest_sha256) {
+            return Err(TransferError::Rejected);
+        }
+        let mut state = self.state.lock().await;
+        if !state.began {
+            return Ok(TransferState::AwaitingBegin);
+        }
+        if state.bodies.all_bodies_checked(1) {
+            Ok(TransferState::BodiesChecked)
+        } else {
+            Ok(TransferState::Receiving)
+        }
+    }
+
+    async fn commit(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> Result<(), TransferError> {
+        if !self.matches(&transaction_id, &manifest_sha256) {
+            return Err(TransferError::Rejected);
+        }
+        // This synthetic service cannot publish and must not report success.
+        Err(TransferError::NotReady)
+    }
+}
+
+#[tokio::test]
+async fn transfer_contract_streams_synthetic_bodies_over_pinned_tls_and_vox() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let service = MemoryTransfer::new();
+        let digest = service.manifest_digest.clone();
+        let (client, server) = endpoints(
+            fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+            "100.64.0.1",
+            false,
+            false,
+        );
+        let (left, right) = tokio::io::duplex(128 * 1024);
+        let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+        let (client_vox, server_vox) = tokio::join!(
+            vox_transport::establish_client(client_tls.unwrap()),
+            vox_transport::establish_server(
+                server_tls.unwrap(),
+                TransferWireDispatcher::new(service)
+            )
+        );
+        let client_vox = client_vox.unwrap();
+        let _server_vox = server_vox.unwrap();
+        let lane: TransferWireClient = client_vox.open_lane().await.unwrap();
+        let rejected = lane
+            .begin(1, TRANSACTION_ID.to_owned(), "wrong".to_owned())
+            .await;
+        assert!(
+            matches!(rejected, Err(vox::VoxError::User(error)) if *error == TransferError::Rejected)
+        );
+        lane.begin(1, TRANSACTION_ID.to_owned(), digest.clone())
+            .await
+            .unwrap();
+        for (id, body) in [("one", b"hello".as_slice()), ("two", b"world".as_slice())] {
+            let (tx, rx) = vox::channel::<Vec<u8>>();
+            let upload = lane.upload(TRANSACTION_ID.to_owned(), digest.clone(), id.to_owned(), rx);
+            let send = async move {
+                tx.send(body[..2].to_vec()).await.unwrap();
+                tx.send(body[2..].to_vec()).await.unwrap();
+                tx.close(vox::Metadata::default()).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(upload, send);
+            result.unwrap();
+        }
+        assert_eq!(
+            lane.status(TRANSACTION_ID.to_owned(), digest.clone())
+                .await
+                .unwrap(),
+            TransferState::BodiesChecked
+        );
+        let commit = lane.commit(TRANSACTION_ID.to_owned(), digest).await;
+        assert!(
+            matches!(commit, Err(vox::VoxError::User(error)) if *error == TransferError::NotReady)
+        );
+    })
+    .await
+    .expect("in-memory transfer contract timed out");
 }

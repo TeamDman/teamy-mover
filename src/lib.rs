@@ -109,19 +109,20 @@ pub fn main() -> eyre::Result<()> {
     let requested_output_format = cli.global_args.output_format;
     let command_name = cli.command.name();
     tracing::debug!(command = command_name, "Dispatching command");
-    let result = (|| -> eyre::Result<()> {
+    let result: eyre::Result<()> = cancellation_token.with_scope(|scope| {
         let _command_span = tracing::info_span!("command", command = command_name).entered();
         let started = std::time::Instant::now();
-        let output = cli.invoke(cancellation_token.clone())?;
+        let output = cli.invoke(scope.clone())?;
         let threshold = output.elapsed_duration_warn_threshold;
-        let emitted = cancellation_token
+        let emitted = scope
             .bail_if_cancelled()
+            .map_err(eyre::Report::new)
             .and_then(|()| output.emit(requested_output_format));
         elapsed_duration::warn_if_exceeded(command_name, started.elapsed(), threshold);
         emitted?;
-        cancellation_token.bail_if_cancelled()?;
+        scope.bail_if_cancelled()?;
         Ok(())
-    })();
+    });
     tracing::debug!(
         command = command_name,
         success = result.is_ok(),

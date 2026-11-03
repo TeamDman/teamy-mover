@@ -15,10 +15,14 @@ use rustls::server::WebPkiClientVerifier;
 use sha2::Digest;
 use sha2::Sha256;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
+use tokio::io::ReadBuf;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
@@ -38,6 +42,56 @@ pub struct ServerEndpoint {
     config: Arc<ServerConfig>,
     client_pin: [u8; 32],
 }
+
+/// Client stream returned only after ordinary TLS validation and pin checking.
+pub struct AuthenticatedClient<S>(tokio_rustls::client::TlsStream<S>);
+
+/// Server stream returned only after ordinary mutual-TLS validation and pin checking.
+pub struct AuthenticatedServer<S>(tokio_rustls::server::TlsStream<S>);
+
+macro_rules! authenticated_stream {
+    ($name:ident) => {
+        impl<S> fmt::Debug for $name<S> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name)).finish_non_exhaustive()
+            }
+        }
+
+        impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for $name<S> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+            }
+        }
+
+        impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for $name<S> {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+            }
+        }
+    };
+}
+
+authenticated_stream!(AuthenticatedClient);
+authenticated_stream!(AuthenticatedServer);
 
 impl fmt::Debug for ClientEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,7 +157,7 @@ impl ClientEndpoint {
     ///
     /// # Errors
     /// Returns an error on timeout, TLS validation failure, or a pin mismatch.
-    pub async fn connect<S>(&self, stream: S) -> Result<tokio_rustls::client::TlsStream<S>>
+    pub async fn connect<S>(&self, stream: S) -> Result<AuthenticatedClient<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -114,7 +168,7 @@ impl ClientEndpoint {
         )
         .await??;
         verify_leaf(tls.get_ref().1.peer_certificates(), &self.server_pin)?;
-        Ok(tls)
+        Ok(AuthenticatedClient(tls))
     }
 }
 
@@ -152,13 +206,13 @@ impl ServerEndpoint {
     ///
     /// # Errors
     /// Returns an error on timeout, TLS validation failure, or a pin mismatch.
-    pub async fn accept<S>(&self, stream: S) -> Result<tokio_rustls::server::TlsStream<S>>
+    pub async fn accept<S>(&self, stream: S) -> Result<AuthenticatedServer<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let acceptor = TlsAcceptor::from(Arc::clone(&self.config));
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await??;
         verify_leaf(tls.get_ref().1.peer_certificates(), &self.client_pin)?;
-        Ok(tls)
+        Ok(AuthenticatedServer(tls))
     }
 }
