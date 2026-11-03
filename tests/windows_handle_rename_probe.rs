@@ -1,6 +1,7 @@
 #![cfg(windows)]
 //! Opt-in synthetic probe, not a production publication implementation.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -8,6 +9,11 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
+use teamy_mover::transfer::journal::{JournalApproval, ObjectIdentity};
+use teamy_mover::transfer::transaction_journal::TransactionJournal;
+use teamy_mover::transfer::windows_lock::directory_identity;
+use teamy_mover::transfer::windows_lock::{ExclusiveFile, regular_file_identity};
+use teamy_mover::transfer::windows_stage::{ExpectedEntry, verify_entries};
 use windows::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION;
 use windows::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION_0;
 use windows::Wdk::Storage::FileSystem::FileRenameInformation;
@@ -182,14 +188,145 @@ fn native_relative_directory_rename_is_no_replace() {
     assert_eq!(destination.parent().unwrap(), root);
     let parent = open_directory(&root, false).unwrap();
     let first_handle = open_directory(&first, true).unwrap();
+    let stage_identity = directory_identity(&first_handle).unwrap();
+    let parent_identity = directory_identity(&parent).unwrap();
     let status = nt_rename_relative(&first_handle, &parent, "published");
     assert_eq!(status.0, 0, "native relative rename failed: {status:?}");
+    let published_handle = open_directory(&destination, false).unwrap();
+    assert_eq!(
+        directory_identity(&published_handle).unwrap(),
+        stage_identity
+    );
+    assert_eq!(directory_identity(&first_handle).unwrap(), stage_identity);
+    assert_eq!(directory_identity(&parent).unwrap(), parent_identity);
     assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
     let second_handle = open_directory(&second, true).unwrap();
     let status = nt_rename_relative(&second_handle, &parent, "published");
     assert_eq!(status, STATUS_OBJECT_NAME_COLLISION);
+    assert_eq!(
+        directory_identity(&published_handle).unwrap(),
+        stage_identity
+    );
+    assert_ne!(directory_identity(&second_handle).unwrap(), stage_identity);
     assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
     assert_eq!(fs::read(second.join("second.txt")).unwrap(), b"second");
+}
+
+#[test]
+#[ignore = "manual native Windows recovery probe; does not establish production isolation or crash durability"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the complete synthetic commit and recovery sequence visible together"
+)]
+fn persisted_intent_matches_renamed_synthetic_stage_after_reopen() {
+    let base = fixture_base();
+    fs::create_dir_all(&base).unwrap();
+    let base = fs::canonicalize(base).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("intent-rename-")
+        .tempdir_in(&base)
+        .unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    assert!(root.starts_with(&base) && root != base);
+    let stage_path = root.join("stage");
+    let final_path = root.join("published");
+    let journal_path = root.join("journal");
+    fs::create_dir(&stage_path).unwrap();
+    fs::write(stage_path.join("a.bin"), b"hello").unwrap();
+    File::create(&journal_path).unwrap();
+    let parent = open_directory(&root, false).unwrap();
+    let stage = open_directory(&stage_path, true).unwrap();
+    let parent_id = directory_identity(&parent).unwrap();
+    let stage_id = directory_identity(&stage).unwrap();
+    let journal_id = regular_file_identity(&File::open(&journal_path).unwrap()).unwrap();
+    let file_id = regular_file_identity(&File::open(stage_path.join("a.bin")).unwrap()).unwrap();
+    let object_id = |id: teamy_mover::transfer::windows_lock::FileIdentity| ObjectIdentity {
+        volume_serial: id.volume_serial,
+        file_index: id.file_index,
+    };
+    let transaction_id = "0123456789abcdef0123456789abcdef";
+    let pin = "1111111111111111111111111111111111111111111111111111111111111111";
+    let hash = format!("{:x}", Sha256::digest(b"hello"));
+    let manifest = format!(
+        r#"{{"aggregate_bytes":5,"expires_unix":100,"file_count":1,"files":[{{"id":"one","name":"a.bin","sha256":"{hash}","size":5}}],"transaction_id":"{transaction_id}","version":1}}"#
+    );
+    let digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+    let approval = JournalApproval {
+        manifest_bytes: manifest.as_bytes(),
+        manifest_sha256: &digest,
+        transaction_id,
+        client_pin: pin,
+        server_pin: pin,
+        destination_parent: object_id(parent_id),
+        stage_directory: object_id(stage_id),
+        journal_file: object_id(journal_id),
+        final_name: "published",
+        now_unix: 1,
+    };
+    let lock = || ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+    let mut journal = TransactionJournal::initialize(lock(), &approval).unwrap();
+    let mut body = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(stage_path.join("a.bin"))
+        .unwrap();
+    journal.verify_file("one", &mut body, 1).unwrap();
+    journal.record_commit_intent(2).unwrap();
+    drop(body);
+    assert_eq!(nt_rename_relative(&stage, &parent, "published").0, 0);
+    drop(journal);
+    let mut recovered = TransactionJournal::reopen(lock(), &approval).unwrap();
+    let mut published = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(&final_path)
+        .unwrap();
+    assert!(recovered.intent_matches_directory(&published).unwrap());
+    assert!(!recovered.intent_matches_directory(&parent).unwrap());
+    verify_entries(
+        &mut published,
+        stage_id,
+        &[ExpectedEntry {
+            name: "a.bin",
+            identity: file_id,
+            size: 5,
+        }],
+    )
+    .unwrap();
+    let mut body = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(final_path.join("a.bin"))
+        .unwrap();
+    recovered.reverify_intent_file("one", &mut body, 3).unwrap();
+    drop(body);
+    fs::write(final_path.join("extra.bin"), b"unexpected").unwrap();
+    assert!(
+        verify_entries(
+            &mut published,
+            stage_id,
+            &[ExpectedEntry {
+                name: "a.bin",
+                identity: file_id,
+                size: 5
+            }],
+        )
+        .is_err()
+    );
+    fs::remove_file(final_path.join("extra.bin")).unwrap();
+    fs::write(final_path.join("a.bin"), b"HELLO").unwrap();
+    let mut changed = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(final_path.join("a.bin"))
+        .unwrap();
+    assert!(
+        recovered
+            .reverify_intent_file("one", &mut changed, 3)
+            .is_err()
+    );
+    assert!(recovered.commit().is_err());
 }
 
 #[test]
