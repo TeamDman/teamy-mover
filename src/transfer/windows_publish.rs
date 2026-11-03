@@ -39,6 +39,34 @@ pub struct QualifiedCommit {
     final_name: String,
 }
 
+/// Retained resources from a future reviewed qualification decision. No
+/// operational constructor exists; DACL diagnostics alone cannot create it.
+pub(crate) struct PublicationQualification {
+    permit: PublicationPermit,
+    stage: CreatedDirectory,
+    destination_parent: File,
+    ancestry: Vec<File>,
+    final_name: String,
+}
+
+impl PublicationQualification {
+    pub(crate) fn bind(
+        self,
+        journal: TransactionJournal,
+        files: BTreeMap<String, ExclusiveFile>,
+    ) -> QualifiedCommit {
+        QualifiedCommit {
+            permit: self.permit,
+            journal,
+            files,
+            stage: self.stage,
+            destination_parent: self.destination_parent,
+            ancestry: self.ancestry,
+            final_name: self.final_name,
+        }
+    }
+}
+
 /// An observed rename outcome, never a power-loss durability guarantee.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RenameOutcome {
@@ -451,11 +479,20 @@ pub(crate) fn synthetic_qualified_commit(
     gate: BlockingIoGate,
     final_name: &str,
 ) -> QualifiedCommit {
+    synthetic_publication_qualification(stage, destination_parent, gate, final_name)
+        .bind(journal, files)
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_publication_qualification(
+    stage: CreatedDirectory,
+    destination_parent: File,
+    gate: BlockingIoGate,
+    final_name: &str,
+) -> PublicationQualification {
     let duplicate = destination_parent.try_clone().unwrap();
-    QualifiedCommit {
+    PublicationQualification {
         permit: PublicationPermit(gate),
-        journal,
-        files,
         stage,
         destination_parent,
         ancestry: vec![duplicate],

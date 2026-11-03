@@ -1,4 +1,4 @@
-//! Version-one Vox transfer contract, with no operational implementation.
+//! Version-one Vox transfer contract, with live operation still gated.
 //!
 //! An implementation must authenticate and bind every request to its locally
 //! approved transaction and manifest; use protected staging and durable
@@ -15,6 +15,8 @@ pub enum TransferError {
     Expired,
     NotReady,
     Failed,
+    /// Publication may have happened; local reconciliation is required.
+    PublicationUncertain,
 }
 
 /// Status of the transfer transaction, not a durability guarantee.
@@ -30,7 +32,8 @@ pub enum TransferState {
 }
 
 /// Remote operations for one previously approved version-one manifest.
-/// No production implementation or operational listener exists yet.
+/// The receiver implementation has no operational qualification constructor
+/// or listener; synthetic tests exercise the commit path using a test permit.
 #[vox::service]
 pub trait TransferWire {
     async fn begin(

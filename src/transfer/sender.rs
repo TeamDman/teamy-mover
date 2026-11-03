@@ -1,9 +1,10 @@
 //! Bounded sender using approved source handles.
 //!
-//! This sends only to a caller-provided authenticated Vox connection. It does
-//! not open a socket, create credentials, publish a destination or delete a
-//! source. A successful return means bodies were accepted by the peer, not
-//! that they were published or are durable.
+//! This uses a caller-provided authenticated Vox connection or an already
+//! connected approved CONNECT stream. It does not open a socket, create
+//! credentials or delete a source. The pre-publication path reports checked
+//! bodies; the commit path reports only the receiver's unconfirmed-durability
+//! state and does not establish receipt replay or crash durability.
 
 use super::manifest::ApprovedFile;
 use super::manifest::ApprovedManifest;
@@ -233,7 +234,7 @@ async fn send_inner(
     manifest: &ApprovedManifest,
     digest: &str,
     sources: Vec<Source>,
-) -> Result<()> {
+) -> Result<TransferWireClient> {
     let mut ready = prepare_sources(manifest, sources).await?;
     let client: TransferWireClient =
         tokio::time::timeout(operation_window(manifest)?, connection.open_lane()).await??;
@@ -269,7 +270,7 @@ async fn send_inner(
         state == TransferState::BodiesChecked,
         "receiver did not verify all bodies"
     );
-    Ok(())
+    Ok(client)
 }
 
 /// Validate a locally selected source set against the approved manifest.
@@ -307,11 +308,57 @@ pub async fn send_prepublication(
 ) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let manifest = parse_approved_manifest(manifest_bytes, manifest_sha256, transaction_id, now)?;
-    tokio::time::timeout(
+    let _client = tokio::time::timeout(
         SESSION_DEADLINE,
         send_inner(connection, &manifest, manifest_sha256, sources),
     )
-    .await?
+    .await??;
+    Ok(())
+}
+
+/// Send approved bodies and request one commit on the same authenticated lane.
+/// This cannot authorize the receiver's qualification or receipt replay gate.
+/// A commit or status failure may mean publication happened; sources are never
+/// deleted, and the receiver requires local reconciliation of uncertain state.
+///
+/// # Errors
+/// Returns an error for failed approval, transfer, commit or status checks.
+pub async fn send_approved_and_commit(
+    connection: &BoundedConnection,
+    manifest_bytes: &[u8],
+    manifest_sha256: &str,
+    transaction_id: &str,
+    sources: Vec<Source>,
+) -> Result<TransferState> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let manifest = parse_approved_manifest(manifest_bytes, manifest_sha256, transaction_id, now)?;
+    tokio::time::timeout(SESSION_DEADLINE, async {
+        let client = send_inner(connection, &manifest, manifest_sha256, sources).await?;
+        tokio::time::timeout(
+            operation_window(&manifest)?,
+            client.commit(transaction_id.to_owned(), manifest_sha256.to_owned()),
+        )
+        .await
+        .map_err(|_error| eyre::eyre!("commit timed out; publication may require inspection"))?
+        .map_err(|_error| eyre::eyre!("commit failed; publication may require inspection"))?;
+        let status_window = operation_window(&manifest).map_err(|_error| {
+            eyre::eyre!("status unavailable; publication may require inspection")
+        })?;
+        let state = tokio::time::timeout(
+            status_window,
+            client.status(transaction_id.to_owned(), manifest_sha256.to_owned()),
+        )
+        .await
+        .map_err(|_error| eyre::eyre!("status timed out; publication may require inspection"))?
+        .map_err(|_error| eyre::eyre!("status failed; publication may require inspection"))?;
+        ensure!(
+            state == TransferState::PublishedDurabilityUnconfirmed,
+            "publication state requires inspection"
+        );
+        Ok(state)
+    })
+    .await
+    .map_err(|_error| eyre::eyre!("transfer timed out; publication may require inspection"))?
 }
 
 /// Request connection shutdown even if the sending future is cancelled. Vox's
@@ -375,6 +422,53 @@ where
         shutdown
     })
     .await?
+}
+
+/// Send and request commit over one approved CONNECT and pinned mTLS session.
+/// The caller supplies an already-connected approved proxy stream and locally
+/// approved target and TLS identity. No alternate route or source deletion is
+/// attempted. A failed or lost commit response requires local reconciliation.
+/// Receipt replay remains separately gated at the receiver.
+///
+/// # Errors
+/// Returns an error for proxy denial, authentication, transfer, commit, status,
+/// deadline, or failure to request shutdown.
+pub async fn send_approved_and_commit_via_proxy<S>(
+    proxy_stream: S,
+    target: &str,
+    tls: &super::tls::ClientEndpoint,
+    manifest_bytes: &[u8],
+    manifest_sha256: &str,
+    transaction_id: &str,
+    sources: Vec<Source>,
+) -> Result<TransferState>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::time::timeout(SESSION_DEADLINE, async {
+        let connection =
+            super::vox_transport::establish_client_via_proxy(proxy_stream, target, tls).await?;
+        let mut guard = ShutdownOnDrop(Some(connection));
+        let result = send_approved_and_commit(
+            guard
+                .0
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("missing connection"))?,
+            manifest_bytes,
+            manifest_sha256,
+            transaction_id,
+            sources,
+        )
+        .await;
+        let shutdown = guard.request_shutdown();
+        let state = result?;
+        shutdown.map_err(|_error| {
+            eyre::eyre!("publication reported; shutdown request failed; inspect receiver state")
+        })?;
+        Ok(state)
+    })
+    .await
+    .map_err(|_error| eyre::eyre!("transfer timed out; publication may require inspection"))?
 }
 
 #[cfg(all(test, windows))]

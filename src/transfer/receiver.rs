@@ -1,9 +1,9 @@
-//! Journal-backed, pre-publication receiver.
+//! Journal-backed receiver with publication behind an unavailable live gate.
 //!
 //! Operational construction is intentionally blocked: a `StagingPermit` cannot
 //! yet be created outside this module. Windows staging isolation and publication
-//! remain unresolved. No listener, path creation, source deletion or publication
-//! is implemented here.
+//! remain unresolved. The commit path is exercised only with a synthetic
+//! qualification; no listener or live permit constructor is implemented here.
 
 use super::blocking_io::BlockingIoGate;
 use super::journal::JournalApproval;
@@ -16,6 +16,7 @@ use super::verified_stream::FileVerifier;
 use super::vox_transport::BoundedConnection;
 use super::vox_transport::{self};
 use super::windows_lock::ExclusiveFile;
+use super::windows_publish::{PublicationQualification, RenameOutcome, RenameResult, commit_qualified_stage};
 use super::wire::TransferError;
 use super::wire::TransferState;
 use super::wire::TransferWire;
@@ -78,6 +79,8 @@ struct State {
     begun: bool,
     authenticated_connection: Option<BoundedConnection>,
     replay_permit: Option<ReceiptReplayPermit>,
+    publication: Option<PublicationQualification>,
+    published_handles: Option<RetainedPublication>,
     in_flight_or_failed: bool,
     deadline: tokio::time::Instant,
     io_gate: BlockingIoGate,
@@ -85,9 +88,50 @@ struct State {
     before_file_io: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     before_receipt_return: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    before_commit_rename: Option<Box<dyn FnOnce() + Send>>,
 }
 
-/// A one-connection receiver that cannot publish or delete files.
+/// Retained only after a locally observed rename; these handles are not by
+/// themselves a qualified receipt-replay permit.
+struct RetainedPublication {
+    _stage: super::windows_acl::CreatedDirectory,
+    _parent: std::fs::File,
+    _ancestry: Vec<std::fs::File>,
+}
+
+impl State {
+    fn new(
+        journal: TransactionJournal,
+        manifest: ApprovedManifest,
+        digest: String,
+        files: BTreeMap<String, ExclusiveFile>,
+        io_gate: BlockingIoGate,
+    ) -> Self {
+        Self {
+            journal: Some(journal),
+            manifest,
+            digest,
+            files,
+            begun: false,
+            authenticated_connection: None,
+            replay_permit: None,
+            publication: None,
+            published_handles: None,
+            in_flight_or_failed: false,
+            deadline: tokio::time::Instant::now() + MAX_SESSION,
+            io_gate,
+            #[cfg(test)]
+            before_file_io: None,
+            #[cfg(test)]
+            before_receipt_return: None,
+            #[cfg(test)]
+            before_commit_rename: None,
+        }
+    }
+}
+
+/// A one-connection receiver with no live staging or publication constructor.
 #[derive(Clone)]
 pub struct Receiver {
     state: Arc<Mutex<State>>,
@@ -212,22 +256,13 @@ impl Receiver {
             })
             .await?;
         Ok(Self {
-            state: Arc::new(Mutex::new(State {
-                journal: Some(journal),
+            state: Arc::new(Mutex::new(State::new(
+                journal,
                 manifest,
-                digest: approval.manifest_sha256.to_owned(),
+                approval.manifest_sha256.to_owned(),
                 files,
-                begun: false,
-                authenticated_connection: None,
-                replay_permit: None,
-                in_flight_or_failed: false,
-                deadline: tokio::time::Instant::now() + MAX_SESSION,
-                io_gate: gate,
-                #[cfg(test)]
-                before_file_io: None,
-                #[cfg(test)]
-                before_receipt_return: None,
-            })),
+                gate,
+            ))),
             started: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -331,6 +366,9 @@ impl TransferWire for Receiver {
         if !state.begun {
             return Ok(TransferState::AwaitingBegin);
         }
+        if state.published_handles.is_some() {
+            return Ok(TransferState::PublishedDurabilityUnconfirmed);
+        }
         let journal = state.journal.as_ref().ok_or(TransferError::Failed)?;
         if state
             .manifest
@@ -420,12 +458,58 @@ impl TransferWire for Receiver {
         transaction_id: String,
         manifest_sha256: String,
     ) -> std::result::Result<(), TransferError> {
-        let state = self
+        let mut state = self
             .state
             .try_lock()
             .map_err(|_error| TransferError::NotReady)?;
         check(&state, &transaction_id, &manifest_sha256)?;
-        Err(TransferError::NotReady)
+        if !state.begun || state.publication.is_none() || state.journal.is_none() {
+            return Err(TransferError::NotReady);
+        }
+        let connection = state.authenticated_connection.clone().ok_or(TransferError::NotReady)?;
+        if tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false } {
+            return Err(TransferError::NotReady);
+        }
+        let (budget, _) = worker_budget(&state).map_err(|_error| TransferError::Expired)?;
+        let qualification = state.publication.take().ok_or(TransferError::NotReady)?;
+        let journal = state.journal.take().ok_or(TransferError::Failed)?;
+        let files = std::mem::take(&mut state.files);
+        state.in_flight_or_failed = true;
+        let input = qualification.bind(journal, files);
+        #[cfg(test)]
+        let hook = state.before_commit_rename.take();
+        let work = async move {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                return super::windows_publish::synthetic_commit_with_hook(input, budget, hook).await;
+            }
+            commit_qualified_stage(input, budget).await
+        };
+        let result = tokio::select! {
+            biased;
+            () = connection.closed() => return Err(TransferError::PublicationUncertain),
+            result = work => result,
+        };
+        let RenameResult { outcome, journal, stage, destination_parent, ancestry } =
+            result.map_err(|_error| TransferError::PublicationUncertain)?;
+        state.journal = Some(journal);
+        state.published_handles = Some(RetainedPublication {
+            _stage: stage,
+            _parent: destination_parent,
+            _ancestry: ancestry,
+        });
+        if outcome != RenameOutcome::RenamedDurabilityUnconfirmed {
+            return Err(TransferError::PublicationUncertain);
+        }
+        state.in_flight_or_failed = false;
+        // `closed()` reports observed closure, not instantaneous peer liveness.
+        // No real qualification can be constructed until this boundary is reviewed.
+        if check(&state, &transaction_id, &manifest_sha256).is_err()
+            || tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false }
+        {
+            return Err(TransferError::PublicationUncertain);
+        }
+        Ok(())
     }
 }
 
@@ -815,6 +899,30 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual NTFS commit RPC probe; synthetic qualification only"]
+    async fn qualified_commit_rpc_reports_published_state() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Rpc).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS commit RPC collision probe; synthetic qualification only"]
+    async fn qualified_commit_rpc_reports_uncertain_collision() {
+        protected_three_file_simulation_inner(true, true, None, false, CommitMode::RpcCollision).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS production-sender commit RPC probe; synthetic qualification only"]
+    async fn qualified_commit_rpc_with_production_sender() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcProduction).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS abrupt-disconnect probe; synthetic qualification only"]
+    async fn qualified_commit_rpc_disconnect_after_intent_preserves_stage() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcDisconnect).await;
+    }
+
+    #[tokio::test]
     #[ignore = "manual NTFS rename and journal-reopen probe; not a durability or staging qualification"]
     async fn protected_three_file_rename_and_reopen_recovery() {
         protected_three_file_simulation(true, false, None, false).await;
@@ -993,6 +1101,10 @@ mod tests {
         Timeout,
         Cancel,
         WrongTarget,
+        Rpc,
+        RpcCollision,
+        RpcProduction,
+        RpcDisconnect,
     }
 
     async fn protected_three_file_simulation(
@@ -1030,9 +1142,8 @@ mod tests {
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            RenameOutcome, commit_qualified_stage, rename_with_permit_and_ancestry,
-            synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
-            synthetic_qualified_commit,
+            rename_with_permit_and_ancestry, synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
+            synthetic_publication_qualification, synthetic_qualified_commit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1088,6 +1199,166 @@ mod tests {
             let journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
             let receiver = Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap();
             let control = receiver.clone();
+            if mode == CommitMode::RpcDisconnect {
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+                let mut receiver_guard = control.state.lock().await;
+                let gate = receiver_guard.io_gate.clone();
+                receiver_guard.publication = Some(synthetic_publication_qualification(stage, parent, gate, "published"));
+                receiver_guard.before_commit_rename = Some(Box::new(move || {
+                    let _started = started.send(());
+                    let _released = wait.recv();
+                }));
+                drop(receiver_guard);
+                let (left, mut bridge_left) = tokio::io::duplex(128 * 1024);
+                let (mut right, mut bridge_right) = tokio::io::duplex(128 * 1024);
+                let bridge = tokio::spawn(async move {
+                    let _copied = tokio::io::copy_bidirectional(&mut bridge_left, &mut bridge_right).await;
+                });
+                let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+                let proxy_and_receiver = async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192);
+                        request.push(right.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"CONNECT 100.64.0.1:49152 HTTP/1.1\r\n"));
+                    right.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                    let authenticated = server.accept(right).await.unwrap();
+                    let connection = receiver.establish(authenticated).await.unwrap();
+                    let _finished = finished_rx.await;
+                    connection
+                };
+                let sender = async {
+                    let connection = vox_transport::establish_client_via_proxy(left, "100.64.0.1:49152", &client).await.unwrap();
+                    let lane: crate::transfer::wire::TransferWireClient = connection.open_lane().await.unwrap();
+                    lane.begin(1, ID.into(), digest.clone()).await.unwrap();
+                    for (id, body) in ids.iter().zip(bodies) {
+                        let (tx, rx) = vox::channel::<Vec<u8>>();
+                        let upload = lane.upload(ID.into(), digest.clone(), (*id).to_owned(), rx);
+                        let send = async move {
+                            tx.send(body.to_vec()).await.unwrap();
+                            tx.close(vox::Metadata::default()).await.unwrap();
+                        };
+                        let (result, ()) = tokio::join!(upload, send);
+                        result.unwrap();
+                    }
+                    let commit = lane.commit(ID.into(), digest.clone());
+                    tokio::pin!(commit);
+                    tokio::select! {
+                        result = &mut commit => panic!("commit completed before disconnect: {result:?}"),
+                        result = started_rx => result.unwrap(),
+                    }
+                    bridge.abort();
+                    let _stopped = bridge.await;
+                    let response = tokio::time::timeout(Duration::from_secs(3), &mut commit).await;
+                    let unlocked = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Ok(receiver_guard) = control.state.try_lock() {
+                                assert!(receiver_guard.in_flight_or_failed);
+                                assert!(receiver_guard.journal.is_none());
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }).await;
+                    let _released = release.send(());
+                    assert!(response.expect("client did not observe disconnect").is_err());
+                    unlocked.expect("receiver did not stop the commit after disconnect");
+                    let journal_path = dir.path().join("private/journal.bin");
+                    let lock = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Ok(lock) = ExclusiveFile::acquire(&journal_path, journal_id) { break lock; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("commit worker did not release resources");
+                    let recovered = TransactionJournal::reopen(lock, &approval).unwrap();
+                    assert!(recovered.commit_intent_stage().is_some());
+                    assert!(recovered.recorded_receipt().is_none());
+                    assert!(!dir.path().join("private/published").exists());
+                    assert!(dir.path().join("private/stage").is_dir());
+                    let _sent = finished_tx.send(());
+                };
+                let ((), _server_conn) = tokio::join!(sender, proxy_and_receiver);
+                return;
+            }
+            if matches!(mode, CommitMode::Rpc | CommitMode::RpcCollision | CommitMode::RpcProduction) {
+                if mode == CommitMode::RpcCollision {
+                    let existing = create_private_child(&parent, parent_id, "published").unwrap();
+                    let existing_id = directory_identity(&existing).unwrap();
+                    let mut marker = create_private_file(&existing, existing_id, "existing.bin").unwrap();
+                    marker.file_mut().write_all(b"already here").unwrap();
+                    drop(marker);
+                    drop(existing);
+                }
+                let mut receiver_guard = control.state.lock().await;
+                let gate = receiver_guard.io_gate.clone();
+                receiver_guard.publication = Some(synthetic_publication_qualification(stage, parent, gate, "published"));
+                drop(receiver_guard);
+                let (left, mut right) = tokio::io::duplex(128 * 1024);
+                let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+                let proxy_and_receiver = async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 8192);
+                        request.push(right.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"CONNECT 100.64.0.1:49152 HTTP/1.1\r\n"));
+                    right.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                    let authenticated = server.accept(right).await.unwrap();
+                    let connection = receiver.establish(authenticated).await.unwrap();
+                    let _finished = finished_rx.await;
+                    connection
+                };
+                let sender = async {
+                    if mode == CommitMode::RpcProduction {
+                        let outcome = crate::transfer::sender::send_approved_and_commit_via_proxy(
+                            left, "100.64.0.1:49152", &client, raw.as_bytes(), &digest, ID, sources,
+                        ).await.unwrap();
+                        assert_eq!(outcome, TransferState::PublishedDurabilityUnconfirmed);
+                        let _sent = finished_tx.send(());
+                        return;
+                    }
+                    let connection = vox_transport::establish_client_via_proxy(left, "100.64.0.1:49152", &client).await.unwrap();
+                    let lane: crate::transfer::wire::TransferWireClient = connection.open_lane().await.unwrap();
+                    lane.begin(1, ID.into(), digest.clone()).await.unwrap();
+                    for (id, body) in ids.iter().zip(bodies) {
+                        let (tx, rx) = vox::channel::<Vec<u8>>();
+                        let upload = lane.upload(ID.into(), digest.clone(), (*id).to_owned(), rx);
+                        let send = async move {
+                            tx.send(body.to_vec()).await.unwrap();
+                            tx.close(vox::Metadata::default()).await.unwrap();
+                        };
+                        let (result, ()) = tokio::join!(upload, send);
+                        result.unwrap();
+                    }
+                    assert_eq!(lane.status(ID.into(), digest.clone()).await.unwrap(), TransferState::BodiesChecked);
+                    assert!(matches!(lane.commit(ID.into(), "0".repeat(64)).await, Err(vox::VoxError::User(error)) if *error == TransferError::Rejected));
+                    let result = lane.commit(ID.into(), digest.clone()).await;
+                    if mode == CommitMode::RpcCollision {
+                        assert!(matches!(result, Err(vox::VoxError::User(error)) if *error == TransferError::PublicationUncertain));
+                        assert!(matches!(lane.status(ID.into(), digest.clone()).await, Err(vox::VoxError::User(error)) if *error == TransferError::Failed));
+                    } else {
+                        result.unwrap();
+                        assert_eq!(lane.status(ID.into(), digest.clone()).await.unwrap(), TransferState::PublishedDurabilityUnconfirmed);
+                        assert!(matches!(lane.receipt(ID.into(), digest.clone()).await, Err(vox::VoxError::User(error)) if *error == TransferError::NotReady));
+                    }
+                    let _sent = finished_tx.send(());
+                };
+                let ((), _server_conn) = tokio::join!(sender, proxy_and_receiver);
+                if mode == CommitMode::RpcCollision {
+                    assert_eq!(std::fs::read(dir.path().join("private/published/existing.bin")).unwrap(), b"already here");
+                    assert!(control.state.lock().await.journal.as_ref().unwrap().recorded_receipt().is_none());
+                } else {
+                    for (name, body) in names.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join("private/published").join(name)).unwrap(), body);
+                    }
+                }
+                for (id, body) in ids.iter().zip(bodies) {
+                    assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                }
+                return;
+            }
             // A synthetic CONNECT tunnel exercises the actual bounded sender,
             // mutual TLS, Vox driver and journal-backed receiver together.
             // The fake stage permit and in-memory tunnel do not qualify a live
@@ -1346,8 +1617,10 @@ mod tests {
                         manifest: parse_approved_manifest(raw.as_bytes(), &digest, ID, now().unwrap()).unwrap(),
                         digest: digest.clone(), files: BTreeMap::new(), begun: false,
                         authenticated_connection: None, replay_permit: Some(synthetic_replay_permit()),
+                        publication: None, published_handles: None,
                         in_flight_or_failed: false, deadline: tokio::time::Instant::now() + Duration::from_secs(10),
                         io_gate: BlockingIoGate::default(), before_file_io: None, before_receipt_return: None,
+                        before_commit_rename: None,
                     })),
                     started: Arc::new(AtomicBool::new(false)),
                 };
