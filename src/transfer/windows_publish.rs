@@ -9,8 +9,9 @@ use super::journal::{JournalBinding, ObjectIdentity};
 use super::manifest::valid_component;
 use super::transaction_journal::TransactionJournal;
 use super::windows_acl::{CreatedDirectory, open_checked_child};
-use super::windows_lock::directory_identity;
+use super::windows_lock::{ExclusiveFile, directory_identity};
 use eyre::{Result, ensure};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::windows::io::AsRawHandle;
 use std::time::Duration;
@@ -24,6 +25,19 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 /// No operational constructor is provided.
 #[derive(Debug)]
 pub struct PublicationPermit(BlockingIoGate);
+
+/// Resources that a future independently reviewed qualification gate must
+/// construct as one bound unit. No operational constructor exists.
+#[derive(Debug)]
+pub struct QualifiedCommit {
+    permit: PublicationPermit,
+    journal: TransactionJournal,
+    files: BTreeMap<String, ExclusiveFile>,
+    stage: CreatedDirectory,
+    destination_parent: File,
+    ancestry: Vec<File>,
+    final_name: String,
+}
 
 /// An observed rename outcome, never a power-loss durability guarantee.
 #[derive(Debug, PartialEq, Eq)]
@@ -327,6 +341,126 @@ pub async fn rename_with_permit_and_ancestry(
         || {},
     )
     .await
+}
+
+/// Reverify an approved stage, record intent and attempt the no-replace rename
+/// under one absolute budget. There is no operational `QualifiedCommit`
+/// constructor. This coordinator alone does not prove filesystem isolation,
+/// peer liveness, a deliverable receipt, or power-loss durability.
+///
+/// # Errors
+/// Returns an error for invalid bindings, expiry, verification or I/O failure,
+/// an uncertain pending rename, or a timeout requiring local inspection.
+pub async fn commit_qualified_stage(
+    input: QualifiedCommit,
+    budget: Duration,
+) -> Result<RenameResult> {
+    commit_qualified_stage_inner(input, budget, || {}).await
+}
+
+async fn commit_qualified_stage_inner<F>(
+    mut input: QualifiedCommit,
+    budget: Duration,
+    after_intent: F,
+) -> Result<RenameResult>
+where
+    F: FnOnce() + Send + 'static,
+{
+    ensure!(
+        !budget.is_zero() && budget <= Duration::from_secs(30),
+        "invalid commit budget"
+    );
+    ensure!(
+        !input.ancestry.is_empty() && input.ancestry.len() <= 64,
+        "invalid retained ancestry"
+    );
+    ensure!(
+        valid_component(&input.final_name),
+        "invalid final directory component"
+    );
+    let deadline = std::time::Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| eyre::eyre!("commit deadline overflow"))?;
+    // Both phases use the permit's same single-flight gate. A competing
+    // operation between preflight and rename makes the rename fail closed.
+    let gate = input.permit.0.clone();
+    let worker_gate = gate.clone();
+    let prepared = gate
+        .run(budget, move || {
+            worker_gate.ensure_active()?;
+            input.journal.check_pre_intent_target(
+                &input.destination_parent,
+                &input.stage,
+                &input.final_name,
+            )?;
+            worker_gate.ensure_active()?;
+            input.journal.prepare_staged_commit_before(
+                &input.stage,
+                &mut input.files,
+                deadline,
+                &worker_gate,
+            )?;
+            after_intent();
+            worker_gate.ensure_active()?;
+            // Windows directory rename requires the verified children to be closed.
+            // The qualification gate must establish the approved same-account trust
+            // boundary and exclude other-user mutation during this interval.
+            drop(std::mem::take(&mut input.files));
+            worker_gate.ensure_active()?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "commit deadline expired"
+            );
+            Ok(input)
+        })
+        .await?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| eyre::eyre!("commit deadline expired after intent"))?;
+    rename_with_permit_and_ancestry(
+        prepared.permit,
+        prepared.journal,
+        prepared.stage,
+        prepared.destination_parent,
+        prepared.ancestry,
+        prepared.final_name,
+        remaining,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn synthetic_commit_with_hook<F>(
+    input: QualifiedCommit,
+    budget: Duration,
+    after_intent: F,
+) -> Result<RenameResult>
+where
+    F: FnOnce() + Send + 'static,
+{
+    commit_qualified_stage_inner(input, budget, after_intent).await
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_qualified_commit(
+    journal: TransactionJournal,
+    files: BTreeMap<String, ExclusiveFile>,
+    stage: CreatedDirectory,
+    destination_parent: File,
+    gate: BlockingIoGate,
+    final_name: &str,
+) -> QualifiedCommit {
+    let duplicate = destination_parent.try_clone().unwrap();
+    QualifiedCommit {
+        permit: PublicationPermit(gate),
+        journal,
+        files,
+        stage,
+        destination_parent,
+        ancestry: vec![duplicate],
+        final_name: final_name.to_owned(),
+    }
 }
 
 #[cfg(test)]

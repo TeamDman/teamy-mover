@@ -916,6 +916,44 @@ impl TransactionJournal {
         self.check_publication_time()
     }
 
+    /// Recheck the approved held target before recording a new commit intent.
+    /// This is an identity/binding check, not an ancestry qualification.
+    pub(crate) fn check_pre_intent_target(
+        &mut self,
+        parent: &File,
+        stage: &File,
+        name: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.progress.commit_intent.is_none(),
+            "commit intent already recorded"
+        );
+        self.check_publication_time()?;
+        self.lock.verify()?;
+        ensure!(
+            read_log(&mut self.lock)? == self.records,
+            "journal changed while held"
+        );
+        let parent_id = directory_identity(parent)?;
+        ensure!(
+            self.binding.matches_publication_target(
+                ObjectIdentity {
+                    volume_serial: parent_id.volume_serial,
+                    file_index: parent_id.file_index,
+                },
+                name,
+            ),
+            "publication parent or final name does not match approval"
+        );
+        let stage_id = directory_identity(stage)?;
+        ensure!(
+            stage_id.volume_serial == self.reserved[1].volume_serial
+                && stage_id.file_index == self.reserved[1].file_index,
+            "stage identity does not match approval"
+        );
+        self.check_publication_time()
+    }
+
     /// Recheck the absolute approval deadline immediately before issuing a
     /// gated rename. A rename that completes after expiry is still an observed
     /// filesystem change and must be reconciled without assuming a receipt.

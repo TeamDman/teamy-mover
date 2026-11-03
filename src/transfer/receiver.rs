@@ -786,6 +786,35 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual NTFS coordinated publication probe; synthetic permit only"]
+    async fn coordinated_commit_publishes_three_verified_files() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Coordinated).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS coordinated collision probe; synthetic permit only"]
+    async fn coordinated_commit_preserves_existing_destination() {
+        protected_three_file_simulation_inner(true, true, None, false, CommitMode::Coordinated).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS timeout probe; synthetic permit only"]
+    async fn coordinated_commit_timeout_after_intent_preserves_stage() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Timeout).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS cancellation probe; synthetic permit only"]
+    async fn coordinated_commit_cancellation_after_intent_preserves_stage() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Cancel).await;
+    }
+
+    #[tokio::test]
+    async fn coordinated_commit_rejects_wrong_target_before_intent() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::WrongTarget).await;
+    }
+
+    #[tokio::test]
     #[ignore = "manual NTFS rename and journal-reopen probe; not a durability or staging qualification"]
     async fn protected_three_file_rename_and_reopen_recovery() {
         protected_three_file_simulation(true, false, None, false).await;
@@ -957,15 +986,41 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep the synthetic transfer, rename and reconciliation sequence together"
-    )]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CommitMode {
+        Manual,
+        Coordinated,
+        Timeout,
+        Cancel,
+        WrongTarget,
+    }
+
     async fn protected_three_file_simulation(
         attempt_rename: bool,
         collision: bool,
         interrupted: Option<(bool, bool)>,
         unexpected_entry: bool,
+    ) {
+        protected_three_file_simulation_inner(
+            attempt_rename,
+            collision,
+            interrupted,
+            unexpected_entry,
+            CommitMode::Manual,
+        )
+        .await;
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the synthetic transfer, rename and reconciliation sequence together"
+    )]
+    async fn protected_three_file_simulation_inner(
+        attempt_rename: bool,
+        collision: bool,
+        interrupted: Option<(bool, bool)>,
+        unexpected_entry: bool,
+        mode: CommitMode,
     ) {
         use crate::transfer::recovery::RecoveryDisposition;
         use crate::transfer::transaction_journal::LocalInspection;
@@ -975,8 +1030,9 @@ mod tests {
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            RenameOutcome, rename_with_permit_and_ancestry, synthetic_delayed_rename,
-            synthetic_permit,
+            RenameOutcome, commit_qualified_stage, rename_with_permit_and_ancestry,
+            synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
+            synthetic_qualified_commit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1071,6 +1127,85 @@ mod tests {
                 assert_eq!(actual, expected);
             }
             verify_entries(&stage, stage_id, &entries).unwrap();
+            if mode != CommitMode::Manual {
+                assert!(attempt_rename && interrupted.is_none() && !unexpected_entry);
+                if collision {
+                    let existing = create_private_child(&parent, parent_id, "published").unwrap();
+                    let existing_id = directory_identity(&existing).unwrap();
+                    let mut marker = create_private_file(&existing, existing_id, "existing.bin").unwrap();
+                    marker.file_mut().write_all(b"already here").unwrap();
+                    drop(marker);
+                    drop(existing);
+                }
+                let journal = receiver_state.journal.take().unwrap();
+                let files = std::mem::take(&mut receiver_state.files);
+                drop(receiver_state);
+                let gate = BlockingIoGate::default();
+                let final_name = if mode == CommitMode::WrongTarget { "wrong" } else { "published" };
+                let input = synthetic_qualified_commit(journal, files, stage, parent, gate.clone(), final_name);
+                if mode == CommitMode::WrongTarget {
+                    let _error = commit_qualified_stage(input, Duration::from_secs(3)).await.unwrap_err();
+                    let journal_path = dir.path().join("private/journal.bin");
+                    let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+                    let reopened = TransactionJournal::reopen(lock, &approval).unwrap();
+                    assert!(reopened.commit_intent_stage().is_none());
+                    assert!(!dir.path().join("private/wrong").exists());
+                    assert!(!dir.path().join("private/published").exists());
+                    assert!(dir.path().join("private/stage").is_dir());
+                    return;
+                }
+                if matches!(mode, CommitMode::Timeout | CommitMode::Cancel) {
+                    assert!(!collision);
+                    let (release, wait) = std::sync::mpsc::channel::<()>();
+                    let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+                    let hook = move || { let _sent = started.send(()); let _released = wait.recv(); };
+                    let task = tokio::spawn(synthetic_commit_with_hook(input, Duration::from_millis(500), hook));
+                    tokio::time::timeout(Duration::from_secs(3), started_rx).await.unwrap().unwrap();
+                    if mode == CommitMode::Cancel {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                    } else {
+                        let _timeout = task.await.unwrap().unwrap_err();
+                    }
+                    let journal_path = dir.path().join("private/journal.bin");
+                    let _held = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                    let _file_held = std::fs::OpenOptions::new().write(true).open(dir.path().join("private/stage/one.bin")).unwrap_err();
+                    assert!(!dir.path().join("private/published").exists());
+                    assert!(gate.run(Duration::from_secs(1), || Ok(())).await.is_err());
+                    release.send(()).unwrap();
+                    let lock = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Ok(lock) = ExclusiveFile::acquire(&journal_path, journal_id) { break lock; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("precommit worker did not release resources");
+                    let recovered = TransactionJournal::reopen(lock, &approval).unwrap();
+                    assert!(recovered.commit_intent_stage().is_some());
+                    assert!(recovered.recorded_receipt().is_none());
+                    assert!(!dir.path().join("private/published").exists());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
+                    return;
+                }
+                let result = commit_qualified_stage(input, Duration::from_secs(3)).await.unwrap();
+                if collision {
+                    assert!(matches!(result.outcome, RenameOutcome::Unconfirmed { .. }));
+                    assert!(result.journal.recorded_receipt().is_none());
+                    assert_eq!(std::fs::read(dir.path().join("private/published/existing.bin")).unwrap(), b"already here");
+                } else {
+                    assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
+                    assert!(result.journal.recorded_receipt().unwrap().contains("published-durability-unconfirmed"));
+                    assert_eq!(result.ancestry.len(), 1);
+                    for (name, body) in names.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join("private/published").join(name)).unwrap(), body);
+                    }
+                }
+                for (id, body) in ids.iter().zip(bodies) {
+                    assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                }
+                return;
+            }
             if unexpected_entry {
                 drop(create_private_file(&stage, stage_id, "unexpected.bin").unwrap());
             }
