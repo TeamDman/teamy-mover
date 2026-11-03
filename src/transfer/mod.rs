@@ -2,6 +2,8 @@
 //!
 //! No network listener, sender, receiver, or file execution is provided yet.
 
+#[cfg(windows)]
+pub mod blocking_io;
 pub mod journal;
 pub mod journal_file;
 pub mod manifest;
