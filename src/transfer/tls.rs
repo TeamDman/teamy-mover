@@ -41,13 +41,31 @@ pub struct ClientEndpoint {
 pub struct ServerEndpoint {
     config: Arc<ServerConfig>,
     client_pin: [u8; 32],
+    #[cfg(windows)]
+    server_pin: [u8; 32],
 }
 
 /// Client stream returned only after ordinary TLS validation and pin checking.
 pub struct AuthenticatedClient<S>(tokio_rustls::client::TlsStream<S>);
 
 /// Server stream returned only after ordinary mutual-TLS validation and pin checking.
-pub struct AuthenticatedServer<S>(tokio_rustls::server::TlsStream<S>);
+pub struct AuthenticatedServer<S>(
+    tokio_rustls::server::TlsStream<S>,
+    #[cfg(windows)] [u8; 32],
+    #[cfg(windows)] [u8; 32],
+);
+
+impl<S> AuthenticatedServer<S> {
+    #[cfg(windows)]
+    pub(crate) const fn client_pin(&self) -> [u8; 32] {
+        self.1
+    }
+
+    #[cfg(windows)]
+    pub(crate) const fn server_pin(&self) -> [u8; 32] {
+        self.2
+    }
+}
 
 macro_rules! authenticated_stream {
     ($name:ident) => {
@@ -183,6 +201,13 @@ impl ServerEndpoint {
         server_key: PrivateKeyDer<'static>,
         client_pin: [u8; 32],
     ) -> Result<Self> {
+        #[cfg(windows)]
+        let server_pin = {
+            let leaf = server_chain
+                .first()
+                .ok_or_else(|| eyre::eyre!("missing server certificate"))?;
+            Sha256::digest(leaf.as_ref()).into()
+        };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = WebPkiClientVerifier::builder_with_provider(
             Arc::new(roots(trust_roots)?),
@@ -199,6 +224,8 @@ impl ServerEndpoint {
         Ok(Self {
             config: Arc::new(config),
             client_pin,
+            #[cfg(windows)]
+            server_pin,
         })
     }
 
@@ -213,6 +240,12 @@ impl ServerEndpoint {
         let acceptor = TlsAcceptor::from(Arc::clone(&self.config));
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await??;
         verify_leaf(tls.get_ref().1.peer_certificates(), &self.client_pin)?;
-        Ok(AuthenticatedServer(tls))
+        Ok(AuthenticatedServer(
+            tls,
+            #[cfg(windows)]
+            self.client_pin,
+            #[cfg(windows)]
+            self.server_pin,
+        ))
     }
 }

@@ -84,6 +84,26 @@ fn pin_is_valid(pin: &str) -> bool {
 }
 
 impl JournalBinding {
+    #[cfg(windows)]
+    pub(crate) fn matches_client_pin(&self, pin: &[u8; 32]) -> bool {
+        self.0.client_pin == Self::format_pin(pin)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn matches_server_pin(&self, pin: &[u8; 32]) -> bool {
+        self.0.server_pin == Self::format_pin(pin)
+    }
+
+    #[cfg(windows)]
+    fn format_pin(pin: &[u8; 32]) -> String {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in pin {
+            let _ignored = write!(&mut hex, "{byte:02x}");
+        }
+        hex
+    }
+
     /// Bind a canonical approved manifest to peer pins and filesystem IDs.
     /// A real receiver must independently establish trusted handles and ACLs.
     ///

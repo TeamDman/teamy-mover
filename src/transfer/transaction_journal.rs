@@ -216,6 +216,18 @@ fn apply(
 }
 
 impl TransactionJournal {
+    pub(crate) fn matches_approval(&self, input: &JournalApproval<'_>) -> Result<bool> {
+        Ok(self.binding == JournalBinding::from_approval(input)?)
+    }
+
+    pub(crate) fn matches_client_pin(&self, pin: &[u8; 32]) -> bool {
+        self.binding.matches_client_pin(pin)
+    }
+
+    pub(crate) fn matches_server_pin(&self, pin: &[u8; 32]) -> bool {
+        self.binding.matches_server_pin(pin)
+    }
+
     /// Initialize an empty file held with zero sharing by `ExclusiveFile`.
     /// A failed write has uncertain outcome and is never automatically repaired.
     ///
