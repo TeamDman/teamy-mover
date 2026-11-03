@@ -62,6 +62,31 @@ pub fn regular_file_identity(file: &File) -> Result<FileIdentity> {
     })
 }
 
+/// Read a retained directory handle's identity and reject a reparse point.
+/// This does not establish safe ancestry, ACLs, or permission to publish.
+///
+/// # Errors
+/// Returns an error if the handle is not a non-reparse directory with an ID.
+pub fn directory_identity(file: &File) -> Result<FileIdentity> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live Windows handle and `info` is writable.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info)? };
+    ensure!(
+        info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+            && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
+        "handle must be a non-reparse directory"
+    );
+    let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    ensure!(
+        file_index != 0,
+        "filesystem did not provide a usable directory identity"
+    );
+    Ok(FileIdentity {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index,
+    })
+}
+
 impl ExclusiveFile {
     pub(crate) fn file_mut(&mut self) -> &mut File {
         &mut self.file

@@ -11,6 +11,7 @@ use super::manifest::ApprovedManifest;
 use super::manifest::parse_approved_manifest;
 use super::verified_stream::FileVerifier;
 use super::windows_lock::ExclusiveFile;
+use super::windows_lock::directory_identity;
 use super::windows_lock::regular_file_identity;
 use eyre::Result;
 use eyre::bail;
@@ -471,10 +472,37 @@ impl TransactionJournal {
     /// # Errors
     /// Returns an error on mismatch, expiry, invalid identity or I/O failure.
     pub fn verify_file(&mut self, id: &str, file: &mut File, now: u64) -> Result<()> {
+        self.verify_file_inner(id, file, now, false)
+    }
+
+    /// Recheck a previously verified file after commit intent was recorded.
+    /// This checks its retained identity, length and hash without appending to
+    /// the journal. It does not identify a final directory, establish an exact
+    /// file set, reconcile an ambiguous rename, or authorize a receipt.
+    ///
+    /// # Errors
+    /// Returns an error if intent or the prior observation is missing, or if
+    /// identity, content, expiry, or I/O checks fail.
+    pub fn reverify_intent_file(&mut self, id: &str, file: &mut File, now: u64) -> Result<()> {
+        ensure!(self.commit_intent.is_some(), "commit intent is missing");
+        ensure!(
+            self.files.get(id).is_some_and(|entry| entry.verified),
+            "prior verified file observation is missing"
+        );
+        self.verify_file_inner(id, file, now, true)
+    }
+
+    fn verify_file_inner(
+        &mut self,
+        id: &str,
+        file: &mut File,
+        now: u64,
+        allow_intent: bool,
+    ) -> Result<()> {
         ensure!(
             !self.poisoned
                 && !self.aborted
-                && self.commit_intent.is_none()
+                && (allow_intent || self.commit_intent.is_none())
                 && now < self.manifest.expires_unix(),
             "journal unavailable"
         );
@@ -564,6 +592,21 @@ impl TransactionJournal {
     #[must_use]
     pub const fn commit_intent_stage(&self) -> Option<ObjectIdentity> {
         self.commit_intent
+    }
+
+    /// Compare a retained, non-reparse directory handle to the recorded
+    /// pre-rename stage identity. A match alone does not prove containment,
+    /// access control, exact contents, a rename, or permission for a receipt.
+    ///
+    /// # Errors
+    /// Returns an error if commit intent is absent or the handle is unsafe.
+    pub fn intent_matches_directory(&self, directory: &File) -> Result<bool> {
+        let recorded = self
+            .commit_intent
+            .ok_or_else(|| eyre::eyre!("commit intent is missing"))?;
+        let actual = directory_identity(directory)?;
+        Ok(actual.volume_serial == recorded.volume_serial
+            && actual.file_index == recorded.file_index)
     }
 
     /// Publication and receipt generation are deliberately unavailable.

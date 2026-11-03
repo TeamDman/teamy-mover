@@ -7,13 +7,17 @@ use std::fs::OpenOptions;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use teamy_mover::transfer::journal::JournalApproval;
 use teamy_mover::transfer::journal::ObjectIdentity;
 use teamy_mover::transfer::transaction_journal::TransactionJournal;
 use teamy_mover::transfer::windows_lock::ExclusiveFile;
 use teamy_mover::transfer::windows_lock::FileIdentity;
+use teamy_mover::transfer::windows_lock::directory_identity;
 use teamy_mover::transfer::windows_lock::regular_file_identity;
+use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 const PIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -209,9 +213,31 @@ fn commit_intent_persists_bound_stage_identity_without_claiming_publication() {
     drop(journal);
 
     let recorded = std::fs::read(&fixture.journal).unwrap();
-    let reopened = TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 3)).unwrap();
+    let mut reopened =
+        TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 3)).unwrap();
     assert_eq!(reopened.commit_intent_stage(), Some(expected_stage));
     assert!(reopened.commit().is_err());
+    reopened
+        .reverify_intent_file("one", &mut fixture.body(), 3)
+        .unwrap();
+    let other_path = fixture.dir.path().join("different-identity");
+    std::fs::write(&other_path, b"hello").unwrap();
+    let mut other = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(other_path)
+        .unwrap();
+    assert!(reopened.reverify_intent_file("one", &mut other, 3).is_err());
+    std::fs::write(&fixture.body, b"HELLO").unwrap();
+    assert!(
+        reopened
+            .reverify_intent_file("one", &mut fixture.body(), 3)
+            .is_err()
+    );
+    std::fs::write(&fixture.body, b"hello").unwrap();
+    reopened
+        .reverify_intent_file("one", &mut fixture.body(), 3)
+        .unwrap();
     drop(reopened);
     assert_eq!(std::fs::read(&fixture.journal).unwrap(), recorded);
     assert_eq!(std::fs::read(&fixture.body).unwrap(), b"hello");
@@ -220,4 +246,36 @@ fn commit_intent_persists_bound_stage_identity_without_claiming_publication() {
     mismatched.stage_directory.file_index ^= 1;
     let _error = TransactionJournal::reopen(fixture.lock(), &mismatched).unwrap_err();
     assert_eq!(std::fs::read(&fixture.journal).unwrap(), recorded);
+}
+
+#[test]
+fn intent_matches_only_the_recorded_non_reparse_directory_handle() {
+    let fixture = Fixture::new();
+    let stage_path = fixture.dir.path().join("stage");
+    let other_path = fixture.dir.path().join("other-stage");
+    std::fs::create_dir(&stage_path).unwrap();
+    std::fs::create_dir(&other_path).unwrap();
+    let open_dir = |path: &std::path::Path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+            .unwrap()
+    };
+    let stage = open_dir(&stage_path);
+    let other = open_dir(&other_path);
+    let id = directory_identity(&stage).unwrap();
+    let mut approval = fixture.approval(PIN, 1);
+    approval.stage_directory = ObjectIdentity {
+        volume_serial: id.volume_serial,
+        file_index: id.file_index,
+    };
+    let mut journal = TransactionJournal::initialize(fixture.lock(), &approval).unwrap();
+    let _missing_intent = journal.intent_matches_directory(&stage).unwrap_err();
+    journal.verify_file("one", &mut fixture.body(), 1).unwrap();
+    journal.record_commit_intent(2).unwrap();
+    assert!(journal.intent_matches_directory(&stage).unwrap());
+    assert!(!journal.intent_matches_directory(&other).unwrap());
+    let _not_a_directory = journal.intent_matches_directory(&fixture.body()).unwrap_err();
+    assert!(journal.commit().is_err());
 }
