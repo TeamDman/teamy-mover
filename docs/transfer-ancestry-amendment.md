@@ -42,14 +42,20 @@ and [inheritance description](https://learn.microsoft.com/en-us/openspecs/window
 The diagnostic is not a qualification decision and must not be used as a
 publication permit.
 
-Owner classification also requires review. The candidate filter currently
-trusts only the approved user, LocalSystem and the built-in Administrators
-group. A system-managed volume root may instead be owned by the Windows
-TrustedInstaller service SID. The diagnostic must continue rejecting an owner
-outside its explicit trusted set until the exact SID's authority and inclusion
-in the approved OS trust boundary have been independently reviewed. A
-display-name match, an ACL-only result, or the presence of a system service
-account alone is not sufficient to trust it.
+Owner classification also requires review. In the root diagnostic only, the
+exact TrustedInstaller service SID may be a candidate owner after Windows
+resolves the fully qualified local service name and the result matches a pinned
+SID, expected domain and type. An altered SID, other service, or unverified
+resolution remains rejected. This exception does not trust service ACE grants
+or apply to any descendant, and the concrete mechanism requires independent
+review before use. A display-name match or ACL-only result is not sufficient.
+
+The current candidate and strict filters also treat the process-user SID as
+trusted when examining an ACL. That classification is not proof that all
+same-account processes are trusted outside the approved staging window. An
+owner may be able to change its DACL, and a process can retain earlier handles.
+Do not treat these filters as an ancestry qualification until a separately
+reviewed mechanism reconciles those facts with the stated trust boundary.
 
 * Anchor the intended local filesystem and volume-root identity using trusted
   local approval, not a peer-supplied path or a drive letter alone. Reject

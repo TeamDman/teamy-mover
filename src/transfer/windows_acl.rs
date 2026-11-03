@@ -19,15 +19,16 @@ use windows::Win32::Foundation::{
     ERROR_NO_TOKEN, HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
     GetTokenInformation, IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
-    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, SID_NAME_USE, SidTypeWellKnownGroup, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_LIST_DIRECTORY,
@@ -254,6 +255,72 @@ fn is_trusted_sid(sid: PSID, user: PSID) -> bool {
     same_user || system || admins
 }
 
+// This service SID is documented by Microsoft; compare it with the result of
+// resolving the fully qualified local service name before trusting an owner.
+const TRUSTED_INSTALLER_SID: windows::core::PCWSTR =
+    windows::core::w!("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
+
+fn matches_root_servicing_owner(owner: PSID) -> Result<bool> {
+    let mut resolved = [0_u32; 64];
+    let mut sid_size = u32::try_from(std::mem::size_of_val(&resolved))?;
+    let mut domain = [0_u16; 256];
+    let mut domain_size = u32::try_from(domain.len())?;
+    let mut sid_type = SID_NAME_USE::default();
+    // SAFETY: both output buffers are aligned, writable, and their lengths
+    // match their capacities. The system and account strings are valid.
+    unsafe {
+        LookupAccountNameW(
+            windows::core::PCWSTR::null(),
+            windows::core::w!("NT SERVICE\\TrustedInstaller"),
+            Some(PSID(resolved.as_mut_ptr().cast())),
+            &raw mut sid_size,
+            Some(windows::core::PWSTR(domain.as_mut_ptr())),
+            &raw mut domain_size,
+            &raw mut sid_type,
+        )?;
+    };
+    ensure!(
+        (8..=std::mem::size_of_val(&resolved)).contains(&usize::try_from(sid_size)?)
+            && usize::try_from(domain_size)? < domain.len()
+            && sid_type == SidTypeWellKnownGroup,
+        "unexpected servicing SID resolution"
+    );
+    let domain_text = String::from_utf16(&domain[..usize::try_from(domain_size)?])?;
+    ensure!(
+        domain_text.eq_ignore_ascii_case("NT SERVICE"),
+        "unexpected service domain"
+    );
+    // SAFETY: the SID buffer is initialized and sid_size was bounded above.
+    let sid_bytes = unsafe {
+        std::slice::from_raw_parts(resolved.as_ptr().cast::<u8>(), usize::try_from(sid_size)?)
+    };
+    ensure!(
+        sid_bytes[0] == 1
+            && sid_bytes[1] <= 15
+            && 8 + 4 * usize::from(sid_bytes[1]) <= sid_bytes.len(),
+        "invalid resolved servicing SID extent"
+    );
+    let resolved_sid = PSID(resolved.as_mut_ptr().cast());
+    // SAFETY: the returned SID is within the aligned resolution buffer.
+    let valid_resolved_sid = unsafe { IsValidSid(resolved_sid) }.as_bool();
+    ensure!(valid_resolved_sid, "invalid resolved servicing SID");
+    let mut expected = PSID::default();
+    // SAFETY: the constant string is NUL-terminated; expected is writable.
+    unsafe { ConvertStringSidToSidW(TRUSTED_INSTALLER_SID, &raw mut expected)? };
+    ensure!(!expected.0.is_null(), "missing expected servicing SID");
+    // SAFETY: both SIDs are validated Windows SIDs and remain live.
+    let pinned_matches = unsafe { EqualSid(resolved_sid, expected) }.is_ok();
+    // SAFETY: owner is a valid SID returned in the live security descriptor.
+    let owner_matches = unsafe { EqualSid(owner, expected) }.is_ok();
+    // SAFETY: ConvertStringSidToSidW allocated this SID with LocalAlloc.
+    let _freed = unsafe { LocalFree(Some(HLOCAL(expected.0))) };
+    ensure!(
+        pinned_matches,
+        "resolved servicing SID does not match pinned identity"
+    );
+    Ok(owner_matches)
+}
+
 fn verify_ace(
     acl: *mut ACL,
     index: u32,
@@ -379,10 +446,12 @@ fn verify_descriptor_inner(
             GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted)
         };
         owner_result?;
-        ensure!(
-            !owner.0.is_null() && is_trusted_sid(owner, user),
-            "untrusted or missing owner"
-        );
+        ensure!(!owner.0.is_null(), "untrusted or missing owner");
+        // SAFETY: owner is part of the validated, live security descriptor.
+        ensure!(unsafe { IsValidSid(owner) }.as_bool(), "invalid owner SID");
+        let trusted_owner = is_trusted_sid(owner, user)
+            || (root_sibling_create_candidate && matches_root_servicing_owner(owner)?);
+        ensure!(trusted_owner, "untrusted or missing owner");
     }
     let mut present = windows::core::BOOL(0);
     let mut defaulted = windows::core::BOOL(0);
@@ -885,13 +954,32 @@ mod tests {
     }
 
     #[test]
+    fn servicing_owner_is_exact_and_limited_to_root_diagnostic() {
+        const SERVICE_SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut words = sid_storage(&system_sid).unwrap();
+        let user = PSID(words.as_mut_ptr().cast());
+        let exact = descriptor(&format!("O:{SERVICE_SID}G:SYD:P(A;;FA;;;SY)"));
+        verify_descriptor_inner(exact.0, user, true, true, true).unwrap();
+        assert!(verify_descriptor(exact.0, user, true).is_err());
+        let altered = descriptor(
+            "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465G:SYD:P(A;;FA;;;SY)",
+        );
+        assert!(verify_descriptor_inner(altered.0, user, true, true, true).is_err());
+        let other_service = descriptor("O:S-1-5-80-1-2-3-4-5G:SYD:P(A;;FA;;;SY)");
+        assert!(verify_descriptor_inner(other_service.0, user, true, true, true).is_err());
+        let grant = descriptor(&format!("O:{SERVICE_SID}G:SYD:P(A;;FA;;;{SERVICE_SID})"));
+        assert!(verify_descriptor_inner(grant.0, user, true, true, true).is_err());
+    }
+
+    #[test]
     fn inherit_only_root_grant_can_be_effective_on_a_child() {
         let sid = process_user_sid().unwrap();
         let mut words = sid_storage(&sid).unwrap();
         let mut string = windows::core::PWSTR::null();
         // SAFETY: the SID is validated and string is a writable out pointer.
         unsafe {
-            ConvertSidToStringSidW(PSID(words.as_mut_ptr().cast()), &raw mut string).unwrap()
+            ConvertSidToStringSidW(PSID(words.as_mut_ptr().cast()), &raw mut string).unwrap();
         };
         // SAFETY: Windows returned a valid NUL-terminated SID string.
         let user_sid = unsafe { string.to_string().unwrap() };
