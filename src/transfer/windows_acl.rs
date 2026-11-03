@@ -6,13 +6,13 @@
 //! It does not protect against a hostile process under the trusted account.
 
 use super::manifest::valid_component;
-use super::windows_lock::{FileIdentity, directory_identity};
+use super::windows_lock::{ExclusiveFile, FileIdentity, directory_identity, regular_file_identity};
 use eyre::{Result, ensure};
 use std::fs::File;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
     FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows::Win32::Foundation::{
@@ -31,9 +31,9 @@ use windows::Win32::Security::{
     WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-    READ_CONTROL, SYNCHRONIZE,
+    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_MODE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::{
@@ -526,14 +526,28 @@ fn inspect_directory_acl(
     root_sibling_create_candidate: bool,
 ) -> Result<()> {
     directory_identity(directory)?;
+    inspect_object_acl(
+        directory,
+        user_sid,
+        require_protected,
+        root_sibling_create_candidate,
+    )
+}
+
+fn inspect_object_acl(
+    object: &File,
+    user_sid: &[u8],
+    require_protected: bool,
+    root_sibling_create_candidate: bool,
+) -> Result<()> {
     let mut user_words = sid_storage(user_sid)?;
     let user = PSID(user_words.as_mut_ptr().cast());
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the retained directory handle and out pointer are live. Windows
+    // SAFETY: the retained object handle and out pointer are live. Windows
     // allocates the returned self-relative descriptor with LocalAlloc.
     let status = unsafe {
         GetSecurityInfo(
-            HANDLE(directory.as_raw_handle()),
+            HANDLE(object.as_raw_handle()),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             None,
@@ -756,6 +770,111 @@ impl CheckedDirectoryChain {
     }
 }
 
+/// Create an empty, exclusively held private file relative to a retained
+/// directory. This is a low-level primitive, not a staging permit: callers
+/// must separately establish protected ancestry, effective access, an approved
+/// file-to-manifest binding, transaction ownership and filesystem semantics.
+/// No existing entry is opened or replaced. If post-create validation fails,
+/// the new entry is preserved for inspection rather than deleted or retried.
+/// Run filesystem work through a caller-owned blocking-I/O deadline.
+///
+/// # Errors
+/// Rejects impersonation, unsafe names, mismatched parent identity, insecure
+/// parent/file ACLs, existing entries, and unconfirmed filesystem operations.
+pub fn create_private_file(
+    parent: &File,
+    expected_parent: FileIdentity,
+    name: &str,
+) -> Result<ExclusiveFile> {
+    ensure!(valid_component(name), "invalid private file component");
+    ensure_not_impersonating()?;
+    let user = process_user_sid()?;
+    ensure!(
+        directory_identity(parent)? == expected_parent,
+        "parent identity mismatch"
+    );
+    verify_directory_acl(parent, &user, true)?;
+    let security = private_directory_security()?;
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    let length = u16::try_from(
+        wide.len()
+            .checked_mul(2)
+            .ok_or_else(|| eyre::eyre!("component length overflow"))?,
+    )?;
+    let object_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: windows::core::PWSTR(wide.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())?,
+        RootDirectory: HANDLE(parent.as_raw_handle()),
+        ObjectName: &raw const object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: security.0.0.0.cast(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw = HANDLE::default();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the retained parent, component and descriptor remain live;
+    // output pointers are writable. FILE_CREATE does not open an existing
+    // name, and zero sharing denies competing opens while the handle is held.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            None,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_MODE(0),
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            None,
+            0,
+        )
+    };
+    if status.0 != 0 {
+        if !raw.0.is_null() && raw.0 as isize != -1 {
+            // SAFETY: any non-null, non-invalid handle returned is owned here.
+            let _unexpected = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+        }
+        eyre::bail!(
+            "private file creation was not confirmed; inspect before retrying (NTSTATUS {:#x})",
+            u32::from_ne_bytes(status.0.to_ne_bytes())
+        );
+    }
+    ensure!(
+        !raw.0.is_null() && raw.0 as isize != -1,
+        "file creation returned an invalid handle; inspect before retrying"
+    );
+    // SAFETY: successful NtCreateFile returned a uniquely owned file handle.
+    let file = unsafe { File::from_raw_handle(raw.0) };
+    let result = (|| {
+        let identity = regular_file_identity(&file)?;
+        ensure!(
+            identity.volume_serial == expected_parent.volume_serial,
+            "file volume mismatch"
+        );
+        ensure!(file.metadata()?.len() == 0, "created file is not empty");
+        ensure!(
+            directory_identity(parent)? == expected_parent,
+            "parent identity changed"
+        );
+        inspect_object_acl(&file, &user, true, false)?;
+        verify_directory_acl(parent, &user, true)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err(
+            error.wrap_err("file created but validation failed; preserve it for inspection")
+        );
+    }
+    // The only handle returned by our FILE_CREATE used share mode zero and has
+    // not been duplicated or exposed; transfer ownership to ExclusiveFile.
+    ExclusiveFile::from_created_no_share(file)
+}
+
 /// Exclusively create one private child directory relative to a retained parent
 /// handle. This checks the immediate parent and new object's identity and DACL,
 /// but does not qualify the parent's ancestry or filesystem, establish a
@@ -865,6 +984,10 @@ pub fn create_private_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transfer::journal::{JournalApproval, ObjectIdentity};
+    use crate::transfer::transaction_journal::TransactionJournal;
+    use sha2::{Digest, Sha256};
+    use std::io::Write as _;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
@@ -888,6 +1011,47 @@ mod tests {
         };
         conversion.unwrap();
         LocalDescriptor(result)
+    }
+
+    fn journal_created_file(
+        parent: &File,
+        parent_id: FileIdentity,
+        stage: &File,
+        stage_id: FileIdentity,
+        file: &mut ExclusiveFile,
+    ) {
+        let journal_file = create_private_file(parent, parent_id, "journal.bin").unwrap();
+        let journal_id = journal_file.identity();
+        let identity = |id: FileIdentity| ObjectIdentity {
+            volume_serial: id.volume_serial,
+            file_index: id.file_index,
+        };
+        let transaction = "0123456789abcdef0123456789abcdef";
+        let pin = "1111111111111111111111111111111111111111111111111111111111111111";
+        let hash = format!("{:x}", Sha256::digest(b"synthetic"));
+        let manifest = format!(
+            r#"{{"aggregate_bytes":9,"expires_unix":100,"file_count":1,"files":[{{"id":"one","name":"one.bin","sha256":"{hash}","size":9}}],"transaction_id":"{transaction}","version":1}}"#
+        );
+        let digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+        let approval = JournalApproval {
+            manifest_bytes: manifest.as_bytes(),
+            manifest_sha256: &digest,
+            transaction_id: transaction,
+            client_pin: pin,
+            server_pin: pin,
+            destination_parent: identity(parent_id),
+            stage_directory: identity(stage_id),
+            journal_file: identity(journal_id),
+            final_name: "published",
+            now_unix: 1,
+        };
+        let mut journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
+        journal.claim_empty_file("one", file, 1).unwrap();
+        file.file_mut().write_all(b"synthetic").unwrap();
+        journal.verify_file("one", file.file_mut(), 1).unwrap();
+        journal.record_commit_intent(2).unwrap();
+        assert!(journal.intent_matches_directory(stage).unwrap());
+        assert!(journal.commit().is_err());
     }
 
     #[test]
@@ -1041,6 +1205,7 @@ mod tests {
                 (READ_CONTROL
                     | SYNCHRONIZE
                     | FILE_LIST_DIRECTORY
+                    | FILE_ADD_FILE
                     | FILE_ADD_SUBDIRECTORY
                     | FILE_READ_ATTRIBUTES)
                     .0,
@@ -1055,6 +1220,23 @@ mod tests {
         verify_directory_acl(&child, &sid, true).unwrap();
         let child_id = directory_identity(&child).unwrap();
         assert_eq!(child_id.volume_serial, parent_id.volume_serial);
+        let mut created = create_private_file(&child, child_id, "one.bin").unwrap();
+        created.verify().unwrap();
+        journal_created_file(&directory, parent_id, &child, child_id, &mut created);
+        let _competing = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("child/one.bin"))
+            .unwrap_err();
+        let _collision = create_private_file(&child, child_id, "one.bin").unwrap_err();
+        let _traversal = create_private_file(&child, child_id, "../other").unwrap_err();
+        let mut wrong_child = child_id;
+        wrong_child.file_index ^= 1 << 63;
+        let _wrong_child = create_private_file(&child, wrong_child, "other.bin").unwrap_err();
+        drop(created);
+        assert_eq!(
+            std::fs::read(path.join("child/one.bin")).unwrap(),
+            b"synthetic"
+        );
         let reopened = open_checked_child(&directory, parent_id, "child", false).unwrap();
         assert_eq!(directory_identity(&reopened).unwrap(), child_id);
         let mut wrong_parent = parent_id;
