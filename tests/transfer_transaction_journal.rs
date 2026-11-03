@@ -11,6 +11,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use teamy_mover::transfer::journal::JournalApproval;
 use teamy_mover::transfer::journal::ObjectIdentity;
+use teamy_mover::transfer::recovery::RecoveryDisposition;
+use teamy_mover::transfer::transaction_journal::LocalInspection;
 use teamy_mover::transfer::transaction_journal::TransactionJournal;
 use teamy_mover::transfer::windows_lock::ExclusiveFile;
 use teamy_mover::transfer::windows_lock::FileIdentity;
@@ -280,4 +282,72 @@ fn intent_matches_only_the_recorded_non_reparse_directory_handle() {
         .intent_matches_directory(&fixture.body())
         .unwrap_err();
     assert!(journal.commit().is_err());
+}
+
+#[test]
+fn expired_approval_allows_read_only_local_inspection_but_not_live_reopen() {
+    let mut fixture = Fixture::new();
+    let stage_path = fixture.dir.path().join("stage");
+    std::fs::create_dir(&stage_path).unwrap();
+    let staged_body = stage_path.join("a.bin");
+    std::fs::rename(&fixture.body, &staged_body).unwrap();
+    fixture.body = staged_body;
+    let stage = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(&stage_path)
+        .unwrap();
+    let stage_id = directory_identity(&stage).unwrap();
+    let mut approval = fixture.approval(PIN, 1);
+    approval.stage_directory = ObjectIdentity {
+        volume_serial: stage_id.volume_serial,
+        file_index: stage_id.file_index,
+    };
+    let mut journal = TransactionJournal::initialize(fixture.lock(), &approval).unwrap();
+    journal.verify_file("one", &mut fixture.body(), 1).unwrap();
+    journal.record_commit_intent(2).unwrap();
+    drop(journal);
+    let original_journal = std::fs::read(&fixture.journal).unwrap();
+    let mut expired = fixture.approval(PIN, 100);
+    expired.stage_directory = approval.stage_directory;
+    let _live_reopen = TransactionJournal::reopen(fixture.lock(), &expired).unwrap_err();
+    let mut wrong = fixture.approval(WRONG_PIN, 100);
+    wrong.stage_directory = approval.stage_directory;
+    let _wrong_pin = LocalInspection::open(fixture.lock(), &wrong).unwrap_err();
+    let mut inspection = LocalInspection::open(fixture.lock(), &expired).unwrap();
+    assert_eq!(
+        inspection.disposition(),
+        RecoveryDisposition::InspectAmbiguousPublication
+    );
+    assert!(inspection.intent_matches_directory(&stage).unwrap());
+    let body_id = regular_file_identity(&File::open(&fixture.body).unwrap()).unwrap();
+    let mut body = ExclusiveFile::acquire(&fixture.body, body_id).unwrap();
+    inspection.verify_recorded_file("one", &mut body).unwrap();
+    drop(body);
+    let other = fixture.dir.path().join("same-bytes-other-file");
+    std::fs::write(&other, b"hello").unwrap();
+    let other_id = regular_file_identity(&File::open(&other).unwrap()).unwrap();
+    let mut other_file = ExclusiveFile::acquire(&other, other_id).unwrap();
+    let _identity = inspection
+        .verify_recorded_file("one", &mut other_file)
+        .unwrap_err();
+    drop(other_file);
+    std::fs::write(&fixture.body, b"HELLO").unwrap();
+    let mut changed = ExclusiveFile::acquire(&fixture.body, body_id).unwrap();
+    let _hash = inspection
+        .verify_recorded_file("one", &mut changed)
+        .unwrap_err();
+    drop(changed);
+    drop(inspection);
+    assert_eq!(std::fs::read(&fixture.journal).unwrap(), original_journal);
+    assert_eq!(std::fs::read(&fixture.body).unwrap(), b"HELLO");
+    OpenOptions::new()
+        .append(true)
+        .open(&fixture.journal)
+        .unwrap()
+        .write_all(b"TMJ2\0")
+        .unwrap();
+    let torn = std::fs::read(&fixture.journal).unwrap();
+    let _torn = LocalInspection::open(fixture.lock(), &expired).unwrap_err();
+    assert_eq!(std::fs::read(&fixture.journal).unwrap(), torn);
 }

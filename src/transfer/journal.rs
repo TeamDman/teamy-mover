@@ -6,7 +6,10 @@
 //! durability. A checksum detects corruption; it does not authenticate an
 //! attacker-controlled record.
 
+use crate::transfer::manifest::ApprovedManifest;
 use crate::transfer::manifest::parse_approved_manifest;
+#[cfg(windows)]
+use crate::transfer::manifest::parse_for_local_inspection;
 use crate::transfer::manifest::valid_component;
 use eyre::Result;
 use eyre::bail;
@@ -126,6 +129,23 @@ impl JournalBinding {
             approval.transaction_id,
             approval.now_unix,
         )?;
+        Self::from_validated_manifest(approval, &manifest)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn for_local_inspection(approval: &JournalApproval<'_>) -> Result<Self> {
+        let manifest = parse_for_local_inspection(
+            approval.manifest_bytes,
+            approval.manifest_sha256,
+            approval.transaction_id,
+        )?;
+        Self::from_validated_manifest(approval, &manifest)
+    }
+
+    fn from_validated_manifest(
+        approval: &JournalApproval<'_>,
+        manifest: &ApprovedManifest,
+    ) -> Result<Self> {
         ensure!(pin_is_valid(approval.client_pin), "invalid client pin");
         ensure!(pin_is_valid(approval.server_pin), "invalid server pin");
         ensure!(

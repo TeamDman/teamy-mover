@@ -10,6 +10,7 @@ use super::journal::JournalBinding;
 use super::journal::ObjectIdentity;
 use super::manifest::ApprovedManifest;
 use super::manifest::parse_approved_manifest;
+use super::manifest::parse_for_local_inspection;
 use super::verified_stream::FileVerifier;
 use super::windows_lock::ExclusiveFile;
 use super::windows_lock::directory_identity;
@@ -191,19 +192,40 @@ fn approval(
     lock: &ExclusiveFile,
     input: &JournalApproval<'_>,
 ) -> Result<(JournalBinding, ApprovedManifest)> {
+    approval_for_mode(lock, input, false)
+}
+
+fn approval_for_mode(
+    lock: &ExclusiveFile,
+    input: &JournalApproval<'_>,
+    local_inspection: bool,
+) -> Result<(JournalBinding, ApprovedManifest)> {
     let actual = lock.identity();
     ensure!(
         actual.volume_serial == input.journal_file.volume_serial
             && actual.file_index == input.journal_file.file_index,
         "journal handle identity mismatch"
     );
-    let binding = JournalBinding::from_approval(input)?;
-    let manifest = parse_approved_manifest(
-        input.manifest_bytes,
-        input.manifest_sha256,
-        input.transaction_id,
-        input.now_unix,
-    )?;
+    let (binding, manifest) = if local_inspection {
+        (
+            JournalBinding::for_local_inspection(input)?,
+            parse_for_local_inspection(
+                input.manifest_bytes,
+                input.manifest_sha256,
+                input.transaction_id,
+            )?,
+        )
+    } else {
+        (
+            JournalBinding::from_approval(input)?,
+            parse_approved_manifest(
+                input.manifest_bytes,
+                input.manifest_sha256,
+                input.transaction_id,
+                input.now_unix,
+            )?,
+        )
+    };
     Ok((binding, manifest))
 }
 
@@ -369,8 +391,16 @@ impl TransactionJournal {
     ///
     /// # Errors
     /// Returns an error for an invalid binding, framing, sequence or transition.
-    pub fn reopen(mut lock: ExclusiveFile, input: &JournalApproval<'_>) -> Result<Self> {
-        let (binding, manifest) = approval(&lock, input)?;
+    pub fn reopen(lock: ExclusiveFile, input: &JournalApproval<'_>) -> Result<Self> {
+        Self::reopen_for_mode(lock, input, false)
+    }
+
+    fn reopen_for_mode(
+        mut lock: ExclusiveFile,
+        input: &JournalApproval<'_>,
+        local_inspection: bool,
+    ) -> Result<Self> {
+        let (binding, manifest) = approval_for_mode(&lock, input, local_inspection)?;
         let bytes = read_log(&mut lock)?;
         ensure!(!bytes.is_empty(), "empty journal");
         let mut offset = 0usize;
@@ -885,6 +915,106 @@ impl TransactionJournal {
     /// Always returns an error until the reviewed publication gates exist.
     pub fn commit(&self) -> Result<()> {
         bail!("publication is disabled")
+    }
+}
+
+/// Read-only local inspection of a transaction, including after its transfer
+/// approval expired. This wrapper never yields the live journal, writes a
+/// record, returns receipt bytes, starts a listener, or authorizes publication.
+/// Its identity and hash checks do not qualify ancestry or establish that a
+/// directory is the approved final name. Callers must independently establish
+/// those properties and run potentially blocking operations under a deadline.
+#[derive(Debug)]
+pub struct LocalInspection {
+    journal: TransactionJournal,
+}
+
+impl LocalInspection {
+    /// Reopen a locally selected journal under its exclusive lock. Expiry is
+    /// not treated as live authorization; all other manifest, pin, identity,
+    /// framing and sequence validation still applies, and the file is not repaired.
+    ///
+    /// # Errors
+    /// Rejects mismatched local approval, unsafe lock, malformed or torn logs.
+    pub fn open(lock: ExclusiveFile, approval: &JournalApproval<'_>) -> Result<Self> {
+        Ok(Self {
+            journal: TransactionJournal::reopen_for_mode(lock, approval, true)?,
+        })
+    }
+
+    /// Describe what local examination is needed, not whether it succeeded.
+    #[must_use]
+    pub const fn disposition(&self) -> super::recovery::RecoveryDisposition {
+        use super::recovery::RecoveryDisposition;
+        let progress = &self.journal.progress;
+        if progress.aborted {
+            RecoveryDisposition::InspectAborted
+        } else if progress.published.is_some() {
+            RecoveryDisposition::InspectPublished
+        } else if progress.commit_intent.is_some() {
+            RecoveryDisposition::InspectAmbiguousPublication
+        } else {
+            RecoveryDisposition::InspectStaging
+        }
+    }
+
+    /// Compare a retained directory to the commit-intent identity. A match is
+    /// not sufficient to infer that publication occurred or authorize a receipt.
+    ///
+    /// # Errors
+    /// Rejects a missing intent or invalid directory handle.
+    pub fn intent_matches_directory(&self, directory: &File) -> Result<bool> {
+        self.journal.intent_matches_directory(directory)
+    }
+
+    /// Recheck an exclusively held, previously observed file's identity,
+    /// exact length and SHA-256 without writing the file or journal. This does
+    /// not prove containment, a complete file set, or safe access by others.
+    ///
+    /// # Errors
+    /// Rejects absent intent, unknown or unverified files, identity changes,
+    /// digest or length mismatches, and read errors.
+    pub fn verify_recorded_file(&mut self, id: &str, file: &mut ExclusiveFile) -> Result<()> {
+        ensure!(
+            self.journal.progress.commit_intent.is_some(),
+            "commit intent is missing"
+        );
+        let entry = self
+            .journal
+            .files
+            .get(id)
+            .ok_or_else(|| eyre::eyre!("file observation missing"))?;
+        ensure!(entry.verified, "file observation is not verified");
+        let expected_identity = entry.observation.object;
+        let approved = self
+            .journal
+            .manifest
+            .files()
+            .find(|candidate| candidate.id() == id)
+            .ok_or_else(|| eyre::eyre!("unknown file"))?;
+        self.journal.lock.verify()?;
+        file.verify()?;
+        ensure!(
+            identity(file.file_mut())? == expected_identity,
+            "file identity mismatch"
+        );
+        file.file_mut().seek(SeekFrom::Start(0))?;
+        let mut verifier = FileVerifier::new(approved, std::io::sink());
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = file.file_mut().read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            verifier.push(&buffer[..count])?;
+        }
+        verifier.finish()?;
+        file.verify()?;
+        ensure!(
+            identity(file.file_mut())? == expected_identity,
+            "file identity changed"
+        );
+        Ok(())
     }
 }
 

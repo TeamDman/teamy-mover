@@ -128,7 +128,7 @@ pub fn valid_component(value: &str) -> bool {
     !matches!(suffix, Some(s) if s.len() == 1 && matches!(s.as_bytes()[0], b'1'..=b'9'))
 }
 
-fn validate(manifest: &Manifest, expected_id: &str, now_unix: u64) -> Result<()> {
+fn validate(manifest: &Manifest, expected_id: &str, now_unix: Option<u64>) -> Result<()> {
     ensure!(manifest.version == 1, "unsupported manifest version");
     ensure!(
         lowercase_hex(expected_id, 32),
@@ -142,7 +142,10 @@ fn validate(manifest: &Manifest, expected_id: &str, now_unix: u64) -> Result<()>
         manifest.expires_unix <= MAX_SAFE_JSON_INTEGER,
         "expiry outside safe integer range"
     );
-    ensure!(manifest.expires_unix > now_unix, "manifest has expired");
+    ensure!(manifest.expires_unix > 0, "invalid manifest expiry");
+    if let Some(now) = now_unix {
+        ensure!(manifest.expires_unix > now, "manifest has expired");
+    }
     ensure!(
         (1..=MAX_FILES).contains(&manifest.files.len()),
         "invalid file count"
@@ -195,6 +198,31 @@ pub fn parse_approved_manifest(
     expected_sha256: &str,
     expected_transaction_id: &str,
     now_unix: u64,
+) -> Result<ApprovedManifest> {
+    parse_manifest_inner(
+        bytes,
+        expected_sha256,
+        expected_transaction_id,
+        Some(now_unix),
+    )
+}
+
+/// Parse a locally approved manifest for read-only inspection without treating
+/// its expired authorization as permission for a new transfer or receipt.
+#[cfg(windows)]
+pub(crate) fn parse_for_local_inspection(
+    bytes: &[u8],
+    expected_sha256: &str,
+    expected_transaction_id: &str,
+) -> Result<ApprovedManifest> {
+    parse_manifest_inner(bytes, expected_sha256, expected_transaction_id, None)
+}
+
+fn parse_manifest_inner(
+    bytes: &[u8],
+    expected_sha256: &str,
+    expected_transaction_id: &str,
+    now_unix: Option<u64>,
 ) -> Result<ApprovedManifest> {
     ensure!(
         bytes.len() <= MAX_MANIFEST_BYTES,

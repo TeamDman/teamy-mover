@@ -697,6 +697,8 @@ mod tests {
         collision: bool,
         interrupted: Option<(bool, bool)>,
     ) {
+        use crate::transfer::recovery::RecoveryDisposition;
+        use crate::transfer::transaction_journal::LocalInspection;
         use crate::transfer::windows_acl::{
             create_private_child, create_private_file, create_synthetic_private_directory,
             open_checked_child,
@@ -870,6 +872,19 @@ mod tests {
                     recovered.reverify_intent_file(id, file.file_mut(), now().unwrap()).unwrap();
                 }
                 assert!(recovered.commit().is_err());
+                drop(recovered);
+                let expired = JournalApproval { now_unix: expiry, ..approval };
+                let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+                let _expired_live_reopen = TransactionJournal::reopen(lock, &expired).unwrap_err();
+                let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+                let mut inspection = LocalInspection::open(lock, &expired).unwrap();
+                assert_eq!(inspection.disposition(), RecoveryDisposition::InspectPublished);
+                assert!(inspection.intent_matches_directory(&published).unwrap());
+                for (id, entry) in ids.iter().zip(&entries) {
+                    let path = dir.path().join("private/published").join(entry.name);
+                    let mut file = ExclusiveFile::acquire(&path, entry.identity).unwrap();
+                    inspection.verify_recorded_file(id, &mut file).unwrap();
+                }
             } else {
                 drop(receiver_state);
                 assert!(matches!(control.commit(ID.into(), digest.clone()).await, Err(TransferError::NotReady)));
