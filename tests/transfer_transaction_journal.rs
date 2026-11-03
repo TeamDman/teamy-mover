@@ -189,3 +189,35 @@ fn claim_survives_reopen_and_partial_file_is_preserved_for_inspection() {
     assert!(restarted.has_observation("one"));
     assert!(!restarted.has_pending_claim("one"));
 }
+
+#[test]
+fn commit_intent_persists_bound_stage_identity_without_claiming_publication() {
+    let fixture = Fixture::new();
+    let approval = fixture.approval(PIN, 1);
+    let expected_stage = approval.stage_directory;
+    let mut journal = TransactionJournal::initialize(fixture.lock(), &approval).unwrap();
+    assert!(journal.record_commit_intent(1).is_err());
+    assert_eq!(journal.commit_intent_stage(), None);
+    journal.verify_file("one", &mut fixture.body(), 1).unwrap();
+    assert!(journal.record_commit_intent(100).is_err());
+    journal.record_commit_intent(2).unwrap();
+    assert_eq!(journal.commit_intent_stage(), Some(expected_stage));
+    assert!(journal.record_commit_intent(2).is_err());
+    assert!(journal.abort(2).is_err());
+    assert!(journal.verify_file("one", &mut fixture.body(), 2).is_err());
+    assert!(journal.commit().is_err());
+    drop(journal);
+
+    let recorded = std::fs::read(&fixture.journal).unwrap();
+    let reopened = TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 3)).unwrap();
+    assert_eq!(reopened.commit_intent_stage(), Some(expected_stage));
+    assert!(reopened.commit().is_err());
+    drop(reopened);
+    assert_eq!(std::fs::read(&fixture.journal).unwrap(), recorded);
+    assert_eq!(std::fs::read(&fixture.body).unwrap(), b"hello");
+
+    let mut mismatched = fixture.approval(PIN, 3);
+    mismatched.stage_directory.file_index ^= 1;
+    let _error = TransactionJournal::reopen(fixture.lock(), &mismatched).unwrap_err();
+    assert_eq!(std::fs::read(&fixture.journal).unwrap(), recorded);
+}

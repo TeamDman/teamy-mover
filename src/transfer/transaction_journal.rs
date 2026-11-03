@@ -1,9 +1,8 @@
 //! Preliminary Windows transaction journal for verified file observations.
 //!
-//! This is not connected to a receiver. Its records do not prove protected
-//! ancestry, safe staging, publication, or power-loss durability. Commit and
-//! receipt records remain disabled. A trusted caller must separately establish
-//! ACLs, containment and the reviewed local threat boundary.
+//! Records do not prove protected ancestry, safe staging, publication, or
+//! power-loss durability. A commit-intent record is not permission to rename:
+//! publication and receipt records remain disabled until their gates exist.
 
 use super::journal::JournalApproval;
 use super::journal::JournalBinding;
@@ -46,6 +45,7 @@ enum Event {
     Approved,
     FileClaimed(FileObservation),
     FileVerified(FileObservation),
+    CommitIntent(ObjectIdentity),
     Aborted,
 }
 
@@ -77,6 +77,7 @@ pub struct TransactionJournal {
     sequence: u64,
     files: BTreeMap<String, FileEntry>,
     aborted: bool,
+    commit_intent: Option<ObjectIdentity>,
     poisoned: bool,
 }
 
@@ -86,6 +87,7 @@ impl std::fmt::Debug for TransactionJournal {
             .field("sequence", &self.sequence)
             .field("file_count", &self.files.len())
             .field("aborted", &self.aborted)
+            .field("has_commit_intent", &self.commit_intent.is_some())
             .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
@@ -156,19 +158,22 @@ fn approval(
 fn apply(
     event: &Event,
     manifest: &ApprovedManifest,
-    stage_volume: u32,
     reserved: &[ObjectIdentity; 3],
     files: &mut BTreeMap<String, FileEntry>,
     aborted: &mut bool,
+    commit_intent: &mut Option<ObjectIdentity>,
     sequence: u64,
 ) -> Result<()> {
     match event {
         Event::Approved => ensure!(
-            sequence == 1 && files.is_empty() && !*aborted,
+            sequence == 1 && files.is_empty() && !*aborted && commit_intent.is_none(),
             "invalid initial record"
         ),
         Event::FileClaimed(observation) | Event::FileVerified(observation) => {
-            ensure!(sequence > 1 && !*aborted, "invalid file record");
+            ensure!(
+                sequence > 1 && !*aborted && commit_intent.is_none(),
+                "invalid file record"
+            );
             let file = manifest
                 .files()
                 .find(|f| f.id() == observation.id)
@@ -176,7 +181,7 @@ fn apply(
             ensure!(
                 observation.size == file.size()
                     && observation.sha256 == file.sha256()
-                    && observation.object.volume_serial == stage_volume
+                    && observation.object.volume_serial == reserved[1].volume_serial
                     && observation.object.file_index != 0
                     && !reserved.contains(&observation.object),
                 "file observation mismatch"
@@ -207,8 +212,25 @@ fn apply(
                 );
             }
         }
+        Event::CommitIntent(stage) => {
+            ensure!(
+                sequence > 1
+                    && !*aborted
+                    && commit_intent.is_none()
+                    && *stage == reserved[1]
+                    && files.len() == manifest.files().len()
+                    && manifest
+                        .files()
+                        .all(|file| files.get(file.id()).is_some_and(|entry| entry.verified)),
+                "invalid commit intent"
+            );
+            *commit_intent = Some(*stage);
+        }
         Event::Aborted => {
-            ensure!(sequence > 1 && !*aborted, "invalid abort");
+            ensure!(
+                sequence > 1 && !*aborted && commit_intent.is_none(),
+                "invalid abort"
+            );
             *aborted = true;
         }
     }
@@ -258,6 +280,7 @@ impl TransactionJournal {
             sequence: 1,
             files: BTreeMap::new(),
             aborted: false,
+            commit_intent: None,
             poisoned: false,
         })
     }
@@ -275,6 +298,7 @@ impl TransactionJournal {
         let mut sequence = 0u64;
         let mut files = BTreeMap::new();
         let mut aborted = false;
+        let mut commit_intent = None;
         while offset < bytes.len() {
             let remaining = &bytes[offset..];
             ensure!(
@@ -314,7 +338,6 @@ impl TransactionJournal {
             apply(
                 &record.event,
                 &manifest,
-                input.stage_directory.volume_serial,
                 &[
                     input.destination_parent,
                     input.stage_directory,
@@ -322,6 +345,7 @@ impl TransactionJournal {
                 ],
                 &mut files,
                 &mut aborted,
+                &mut commit_intent,
                 sequence,
             )?;
             offset += frame_end;
@@ -340,6 +364,7 @@ impl TransactionJournal {
             sequence,
             files,
             aborted,
+            commit_intent,
             poisoned: false,
         })
     }
@@ -353,13 +378,14 @@ impl TransactionJournal {
             .ok_or_else(|| eyre::eyre!("sequence overflow"))?;
         let mut files = self.files.clone();
         let mut aborted = self.aborted;
+        let mut commit_intent = self.commit_intent;
         apply(
             &event,
             &self.manifest,
-            self.stage_volume,
             &self.reserved,
             &mut files,
             &mut aborted,
+            &mut commit_intent,
             sequence,
         )?;
         let frame = encode(&Record {
@@ -384,6 +410,7 @@ impl TransactionJournal {
         self.records.extend(frame);
         self.files = files;
         self.aborted = aborted;
+        self.commit_intent = commit_intent;
         self.sequence = sequence;
         self.poisoned = false;
         Ok(())
@@ -397,7 +424,10 @@ impl TransactionJournal {
     /// Returns an error for unsafe, nonempty, conflicting or expired inputs.
     pub fn claim_empty_file(&mut self, id: &str, file: &mut ExclusiveFile, now: u64) -> Result<()> {
         ensure!(
-            !self.poisoned && !self.aborted && now < self.manifest.expires_unix(),
+            !self.poisoned
+                && !self.aborted
+                && self.commit_intent.is_none()
+                && now < self.manifest.expires_unix(),
             "journal unavailable"
         );
         self.lock.verify()?;
@@ -442,7 +472,10 @@ impl TransactionJournal {
     /// Returns an error on mismatch, expiry, invalid identity or I/O failure.
     pub fn verify_file(&mut self, id: &str, file: &mut File, now: u64) -> Result<()> {
         ensure!(
-            !self.poisoned && !self.aborted && now < self.manifest.expires_unix(),
+            !self.poisoned
+                && !self.aborted
+                && self.commit_intent.is_none()
+                && now < self.manifest.expires_unix(),
             "journal unavailable"
         );
         let approved = self
@@ -510,6 +543,27 @@ impl TransactionJournal {
     #[must_use]
     pub fn has_pending_claim(&self, id: &str) -> bool {
         self.files.get(id).is_some_and(|entry| !entry.verified)
+    }
+
+    /// Persist the approved stage identity as a commit intent after every file
+    /// has an observation. This does not prove that the files are still safe,
+    /// authorize a rename, establish its outcome, or create a receipt. A real
+    /// publisher must independently revalidate its held handles and access gates.
+    /// Once intent is recorded this instance cannot receive more data or abort;
+    /// recovery must inspect the stage and destination without inferring success.
+    ///
+    /// # Errors
+    /// Returns an error if observations are missing, the journal is unavailable,
+    /// the approval expired, or writing and syncing the record fails.
+    pub fn record_commit_intent(&mut self, now: u64) -> Result<()> {
+        self.persist(Event::CommitIntent(self.reserved[1]), now)
+    }
+
+    /// The journaled pre-rename identity, if commit intent was recorded.
+    /// This is not evidence that a rename took place.
+    #[must_use]
+    pub const fn commit_intent_stage(&self) -> Option<ObjectIdentity> {
+        self.commit_intent
     }
 
     /// Publication and receipt generation are deliberately unavailable.

@@ -193,6 +193,61 @@ fn native_relative_directory_rename_is_no_replace() {
 }
 
 #[test]
+#[ignore = "manual Windows race probe; does not prove crash durability"]
+fn native_relative_no_replace_has_one_winner_under_collision() {
+    let base = fixture_base();
+    fs::create_dir_all(&base).unwrap();
+    let base = fs::canonicalize(base).unwrap();
+    for _ in 0..8 {
+        let dir = tempfile::Builder::new()
+            .prefix("rename-race-")
+            .tempdir_in(&base)
+            .unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        assert!(root.starts_with(&base) && root != base);
+        let first = root.join("stage-one");
+        let second = root.join("stage-two");
+        let destination = root.join("published");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("first.txt"), b"first").unwrap();
+        fs::write(second.join("second.txt"), b"second").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|source| {
+                let source = open_directory(source, true).unwrap();
+                let parent = open_directory(&root, false).unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    nt_rename_relative(&source, &parent, "published")
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|status| status.0 == 0).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|status| **status == STATUS_OBJECT_NAME_COLLISION)
+                .count(),
+            1
+        );
+        if first.exists() {
+            assert_eq!(fs::read(first.join("first.txt")).unwrap(), b"first");
+            assert_eq!(fs::read(destination.join("second.txt")).unwrap(), b"second");
+        } else {
+            assert_eq!(fs::read(second.join("second.txt")).unwrap(), b"second");
+            assert_eq!(fs::read(destination.join("first.txt")).unwrap(), b"first");
+        }
+    }
+}
+
+#[test]
 #[ignore = "manual Windows sharing probe; does not prove staging isolation"]
 fn native_rename_with_exclusively_held_stage_and_file() {
     let base = fixture_base();
