@@ -274,6 +274,165 @@ async fn bounded_vox_exchanges_synthetic_rpc_over_mutual_tls() {
     assert_eq!(lane.echo("synthetic".into()).await.unwrap(), "synthetic");
 }
 
+#[cfg(windows)]
+#[vox::service]
+trait BlockingGateProbe {
+    async fn upload(&self, chunks: vox::Rx<Vec<u8>>) -> Result<(), TransferError>;
+}
+
+#[cfg(windows)]
+#[derive(Clone, Default)]
+struct BlockingGateService {
+    gate: teamy_mover::transfer::blocking_io::BlockingIoGate,
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    use_timer: bool,
+}
+
+#[cfg(windows)]
+impl BlockingGateProbe for BlockingGateService {
+    async fn upload(&self, mut chunks: vox::Rx<Vec<u8>>) -> Result<(), TransferError> {
+        use std::sync::atomic::Ordering;
+        self.progress.fetch_or(1, Ordering::SeqCst);
+        if self.use_timer {
+            self.progress.fetch_or(2, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.progress.fetch_or(4, Ordering::SeqCst);
+        } else {
+            let progress = std::sync::Arc::clone(&self.progress);
+            self.gate
+                .run(std::time::Duration::from_secs(2), move || {
+                    progress.fetch_or(2, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    progress.fetch_or(4, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .map_err(|_error| TransferError::Failed)?;
+        }
+        self.progress.fetch_or(8, Ordering::SeqCst);
+        let mut count = 0usize;
+        while let Some(chunk) = chunks
+            .recv()
+            .await
+            .map_err(|_error| TransferError::Failed)?
+        {
+            count += chunk.get().len();
+            self.progress.fetch_or(16, Ordering::SeqCst);
+        }
+        self.progress.fetch_or(32, Ordering::SeqCst);
+        if count == 5 {
+            Ok(())
+        } else {
+            Err(TransferError::Rejected)
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn gate_probe(use_timer: bool) {
+    use std::sync::atomic::Ordering;
+    let service = BlockingGateService {
+        use_timer,
+        ..BlockingGateService::default()
+    };
+    let progress = std::sync::Arc::clone(&service.progress);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (client, server) = endpoints(
+            fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+            "100.64.0.1",
+            false,
+            false,
+        );
+        let (left, right) = tokio::io::duplex(128 * 1024);
+        let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+        let (client_vox, server_vox) = tokio::join!(
+            vox_transport::establish_client(client_tls.unwrap()),
+            vox_transport::establish_server(
+                server_tls.unwrap(),
+                BlockingGateProbeDispatcher::new(service)
+            )
+        );
+        let client_vox = client_vox.unwrap();
+        let _server_vox = server_vox.unwrap();
+        let lane: BlockingGateProbeClient = client_vox.open_lane().await.unwrap();
+        let (tx, rx) = vox::channel::<Vec<u8>>();
+        let upload = lane.upload(rx);
+        let send = async move {
+            tx.send(b"he".to_vec()).await.unwrap();
+            tx.close(vox::Metadata::default()).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(upload, send);
+        let _error = result.unwrap_err();
+    })
+    .await;
+    outcome.unwrap_or_else(|_| {
+        panic!(
+            "channel handler did not resume; progress bits {}",
+            progress.load(Ordering::SeqCst)
+        )
+    });
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "Vox d567aa14 stalls when a full channel mailbox receives close"]
+async fn incomplete_channel_closes_after_blocking_gate() {
+    gate_probe(false).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "Vox d567aa14 stalls when a full channel mailbox receives close"]
+async fn incomplete_channel_closes_after_async_timer() {
+    gate_probe(true).await;
+}
+
+#[cfg(windows)]
+#[vox::service]
+trait TimerOnlyProbe {
+    async fn wait(&self) -> bool;
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct TimerOnlyService;
+
+#[cfg(windows)]
+impl TimerOnlyProbe for TimerOnlyService {
+    async fn wait(&self) -> bool {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        true
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn timer_without_channel_completes() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (client, server) = endpoints(
+            fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+            "100.64.0.1",
+            false,
+            false,
+        );
+        let (left, right) = tokio::io::duplex(128 * 1024);
+        let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+        let (client_vox, server_vox) = tokio::join!(
+            vox_transport::establish_client(client_tls.unwrap()),
+            vox_transport::establish_server(
+                server_tls.unwrap(),
+                TimerOnlyProbeDispatcher::new(TimerOnlyService)
+            )
+        );
+        let client_vox = client_vox.unwrap();
+        let _server_vox = server_vox.unwrap();
+        let lane: TimerOnlyProbeClient = client_vox.open_lane().await.unwrap();
+        assert!(lane.wait().await.unwrap());
+    })
+    .await
+    .expect("timer-only probe timed out");
+}
+
 const TRANSACTION_ID: &str = "0123456789abcdef0123456789abcdef";
 
 struct MemoryTransferState {
