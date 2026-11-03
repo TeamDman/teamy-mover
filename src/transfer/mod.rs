@@ -9,6 +9,8 @@ pub mod proxy;
 #[cfg(test)]
 mod receiver_model;
 pub mod recovery;
+#[cfg(windows)]
+pub mod sender;
 pub mod session;
 pub mod tls;
 #[cfg(windows)]

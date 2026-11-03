@@ -284,20 +284,32 @@ struct MemoryTransferState {
 #[derive(Clone)]
 struct MemoryTransfer {
     manifest_digest: String,
+    #[cfg(windows)]
+    manifest_bytes: Vec<u8>,
+    #[cfg(windows)]
+    reject_upload: bool,
     state: std::sync::Arc<tokio::sync::Mutex<MemoryTransferState>>,
 }
 
 impl MemoryTransfer {
     fn new() -> Self {
+        Self::with_expiry(100)
+    }
+
+    fn with_expiry(expiry: u64) -> Self {
         let first = format!("{:x}", Sha256::digest(b"hello"));
         let second = format!("{:x}", Sha256::digest(b"world"));
         let raw = format!(
-            r#"{{"aggregate_bytes":10,"expires_unix":100,"file_count":2,"files":[{{"id":"one","name":"a.bin","sha256":"{first}","size":5}},{{"id":"two","name":"b.bin","sha256":"{second}","size":5}}],"transaction_id":"{TRANSACTION_ID}","version":1}}"#
+            r#"{{"aggregate_bytes":10,"expires_unix":{expiry},"file_count":2,"files":[{{"id":"one","name":"a.bin","sha256":"{first}","size":5}},{{"id":"two","name":"b.bin","sha256":"{second}","size":5}}],"transaction_id":"{TRANSACTION_ID}","version":1}}"#
         );
         let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
         let manifest = parse_approved_manifest(raw.as_bytes(), &digest, TRANSACTION_ID, 1).unwrap();
         Self {
             manifest_digest: digest,
+            #[cfg(windows)]
+            manifest_bytes: raw.into_bytes(),
+            #[cfg(windows)]
+            reject_upload: false,
             state: std::sync::Arc::new(tokio::sync::Mutex::new(MemoryTransferState {
                 began: false,
                 bodies: BodySetVerifier::new(manifest, 1).unwrap(),
@@ -337,6 +349,10 @@ impl TransferWire for MemoryTransfer {
     ) -> Result<(), TransferError> {
         if !self.matches(&transaction_id, &manifest_sha256) {
             return Err(TransferError::Rejected);
+        }
+        #[cfg(windows)]
+        if self.reject_upload {
+            return Err(TransferError::Failed);
         }
         let mut state = self.state.lock().await;
         if !state.began {
@@ -451,4 +467,175 @@ async fn transfer_contract_streams_synthetic_bodies_over_pinned_tls_and_vox() {
     })
     .await
     .expect("in-memory transfer contract timed out");
+}
+
+#[cfg(windows)]
+async fn sender_fixture() -> (
+    vox_transport::BoundedConnection,
+    vox_transport::BoundedConnection,
+    MemoryTransfer,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let service = MemoryTransfer::with_expiry(now + 600);
+    let (client, server) = endpoints(
+        fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+        "100.64.0.1",
+        false,
+        false,
+    );
+    let (left, right) = tokio::io::duplex(128 * 1024);
+    let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+    let (client_vox, server_vox) = tokio::join!(
+        vox_transport::establish_client(client_tls.unwrap()),
+        vox_transport::establish_server(
+            server_tls.unwrap(),
+            TransferWireDispatcher::new(service.clone())
+        )
+    );
+    (client_vox.unwrap(), server_vox.unwrap(), service)
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn production_sender_preserves_sources_when_receiver_fails() {
+    use teamy_mover::transfer::sender::Source;
+    use teamy_mover::transfer::sender::send_prepublication;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut service = MemoryTransfer::with_expiry(now + 600);
+        service.reject_upload = true;
+        let (client, server) = endpoints(
+            fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+            "100.64.0.1",
+            false,
+            false,
+        );
+        let (left, right) = tokio::io::duplex(128 * 1024);
+        let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+        let (client_vox, server_vox) = tokio::join!(
+            vox_transport::establish_client(client_tls.unwrap()),
+            vox_transport::establish_server(
+                server_tls.unwrap(),
+                TransferWireDispatcher::new(service.clone())
+            )
+        );
+        let client_vox = client_vox.unwrap();
+        let _server_vox = server_vox.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"world").unwrap();
+        let sources = vec![
+            Source {
+                id: "one".into(),
+                file: std::fs::File::open(&a).unwrap(),
+            },
+            Source {
+                id: "two".into(),
+                file: std::fs::File::open(&b).unwrap(),
+            },
+        ];
+        assert!(
+            send_prepublication(
+                &client_vox,
+                &service.manifest_bytes,
+                &service.manifest_digest,
+                TRANSACTION_ID,
+                sources
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&b).unwrap(), b"world");
+    })
+    .await
+    .expect("sender failure test timed out");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn production_sender_streams_files_over_pinned_tls_without_deleting_sources() {
+    use teamy_mover::transfer::sender::Source;
+    use teamy_mover::transfer::sender::send_prepublication;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (client, _server, service) = sender_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&b, b"world").unwrap();
+        let sources = vec![
+            Source {
+                id: "two".into(),
+                file: std::fs::File::open(&b).unwrap(),
+            },
+            Source {
+                id: "one".into(),
+                file: std::fs::File::open(&a).unwrap(),
+            },
+        ];
+        send_prepublication(
+            &client,
+            &service.manifest_bytes,
+            &service.manifest_digest,
+            TRANSACTION_ID,
+            sources,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&b).unwrap(), b"world");
+        assert!(service.state.lock().await.bodies.all_bodies_checked(1));
+    })
+    .await
+    .expect("sender test timed out");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn production_sender_rejects_bad_source_before_contacting_receiver() {
+    use teamy_mover::transfer::sender::Source;
+    use teamy_mover::transfer::sender::send_prepublication;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (client, _server, service) = sender_fixture().await;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"HELLO").unwrap();
+        std::fs::write(&b, b"world").unwrap();
+        let sources = vec![
+            Source {
+                id: "one".into(),
+                file: std::fs::File::open(&a).unwrap(),
+            },
+            Source {
+                id: "two".into(),
+                file: std::fs::File::open(&b).unwrap(),
+            },
+        ];
+        assert!(
+            send_prepublication(
+                &client,
+                &service.manifest_bytes,
+                &service.manifest_digest,
+                TRANSACTION_ID,
+                sources
+            )
+            .await
+            .is_err()
+        );
+        assert!(!service.state.lock().await.began);
+        assert_eq!(std::fs::read(&a).unwrap(), b"HELLO");
+        assert_eq!(std::fs::read(&b).unwrap(), b"world");
+    })
+    .await
+    .expect("sender test timed out");
 }
