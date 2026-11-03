@@ -49,7 +49,7 @@ pub(super) fn fingerprint(file: &File) -> Result<Fingerprint> {
 }
 
 /// Open an absolute Linux path one component at a time without following any
-/// symlink, including the final component. O_NONBLOCK prevents FIFO opens from
+/// symlink, including the final component. `O_NONBLOCK` prevents FIFO opens from
 /// hanging; fingerprint validation rejects non-regular files and hard links.
 #[cfg(target_os = "linux")]
 pub(crate) fn open_linux(path: &std::path::Path) -> Result<File> {
@@ -78,5 +78,5 @@ pub(crate) fn open_linux(path: &std::path::Path) -> Result<File> {
         }
         parent = opened;
     }
-    eyre::bail!("source path must name a file")
+    Err(eyre::eyre!("source path must name a file"))
 }

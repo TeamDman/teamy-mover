@@ -32,7 +32,7 @@ impl TransferArgs {
         match self.command {
             TransferCommand::ValidateManifest(args) => args.invoke(),
             TransferCommand::Send(_) | TransferCommand::Receive(_) => {
-                eyre::bail!("transfer is not yet available")
+                Err(eyre::eyre!("transfer is not yet available"))
             }
         }
     }
