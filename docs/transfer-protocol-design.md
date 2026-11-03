@@ -163,6 +163,40 @@ implementation must establish access controls and Windows share modes that
 prevent them from changing staged content, or require a dedicated isolated
 account/SID; if neither protection can be demonstrated, refuse to publish.
 
+### Proposed same-account publication boundary (review required)
+
+The operator has authorized trusting other processes running under their own
+Windows account not to interfere with the staging directory, provided that it
+is dedicated and outside ordinary working areas. This is a narrower local
+threat model than the preceding paragraph; it does not protect against a hostile
+process running as that same account. It does not relax protection against
+other users, remote peers, reparse points, unexpected stage contents, or an
+existing destination. The proposed implementation below requires independent
+review before it replaces the preceding fail-closed requirement.
+
+Use a private application staging root, outside normal working directories,
+on the same volume as the destination; fail closed if that location cannot be
+established. Create its per-transaction directory and the journal with explicit
+restrictive security descriptors, not inherited broad permissions, and check
+the entire trusted ancestry, identities, filesystem and descriptors. Do not
+share a stage between transactions. Keep the transaction lock and directory
+handles throughout verification and publication, and create each approved file
+exclusively. Immediately before publication, enumerate and reject all unexpected
+entries, check identities, reject reparse points and hard links, flush and hash
+each approved file, and confirm the journal binding and absent final name.
+
+NTFS may refuse to rename a directory while children are open. If so, after
+verification the receiver may close its child handles just before the rename,
+relying on the stated same-account non-interference assumption for that window.
+Use a same-volume handle-relative Windows no-replace rename to the retained,
+verified destination-parent handle. Test collisions, handle sharing, reparse
+and hard-link rejection, identity checks, and cancellation or process failure at
+every transition using synthetic files. An ambiguous rename or interrupted
+journal update must preserve the objects for inspection and must not produce a
+success receipt or delete a source. No claim of crash durability follows from a
+successful rename; report the explicitly unconfirmed outcome unless the
+required filesystem guarantees are independently established.
+
 Before listening, atomically acquire and hold a cross-process exclusive lock on
 the transaction record using an OS-backed lock or a pre-existing trusted lock
 file opened without sharing, under an identity-checked protected parent. A
