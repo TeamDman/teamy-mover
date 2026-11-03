@@ -17,6 +17,7 @@ use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows::Win32::Storage::FileSystem::GetFileInformationByHandle;
+use windows::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
 
 /// Stable identity returned by Windows for an already-open file handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +86,39 @@ pub fn directory_identity(file: &File) -> Result<FileIdentity> {
         volume_serial: info.dwVolumeSerialNumber,
         file_index,
     })
+}
+
+/// Confirm that a retained non-reparse directory is on a volume reporting
+/// NTFS and that the volume serial still matches the held object. This is a
+/// filesystem-type check, not proof of rename or power-loss semantics.
+pub(crate) fn verify_ntfs_directory(directory: &File) -> Result<FileIdentity> {
+    let identity = directory_identity(directory)?;
+    let mut serial = 0_u32;
+    let mut filesystem = [0_u16; 32];
+    // SAFETY: the directory handle remains live and both output buffers are writable.
+    unsafe {
+        GetVolumeInformationByHandleW(
+            HANDLE(directory.as_raw_handle()),
+            None,
+            Some(&raw mut serial),
+            None,
+            None,
+            Some(&mut filesystem),
+        )?;
+    };
+    let end = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .ok_or_else(|| eyre::eyre!("filesystem name is not terminated"))?;
+    ensure!(
+        String::from_utf16(&filesystem[..end])? == "NTFS",
+        "receiver requires NTFS"
+    );
+    ensure!(
+        serial == identity.volume_serial && directory_identity(directory)? == identity,
+        "volume identity changed"
+    );
+    Ok(identity)
 }
 
 impl ExclusiveFile {

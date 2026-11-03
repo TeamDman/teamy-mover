@@ -92,6 +92,7 @@ impl PrivateDirectorySecurity {
             true,
             false,
             false,
+            false,
         )
     }
 }
@@ -250,7 +251,7 @@ pub fn private_directory_security() -> Result<PrivateDirectorySecurity> {
     );
     // A new object receives its default owner during creation, so the owner
     // must also be checked on the created object's handle before relying on it.
-    verify_descriptor_inner(owned.0, user, true, false, false)?;
+    verify_descriptor_inner(owned.0, user, true, false, false, false)?;
     Ok(PrivateDirectorySecurity(owned))
 }
 
@@ -341,6 +342,7 @@ fn verify_ace(
     user: PSID,
     acl_size: usize,
     root_sibling_create_candidate: bool,
+    downloads_candidate: bool,
 ) -> Result<()> {
     let mut ace_ptr = std::ptr::null_mut();
     // SAFETY: the ACL was validated and ace_ptr is a writable out pointer.
@@ -403,12 +405,13 @@ fn verify_ace(
                         ADD_SUBDIRECTORY
                     } else {
                         0
-                    };
+                    }
+                    | if downloads_candidate { 0x0013_01bf } else { 0 };
                 ensure!(
                     ace.Mask & !permitted == 0,
                     "untrusted principal has non-read access"
                 );
-                if ace.Mask & ADD_SUBDIRECTORY != 0 {
+                if ace.Mask & ADD_SUBDIRECTORY != 0 && !downloads_candidate {
                     ensure!(
                         root_sibling_create_candidate
                             && header.AceFlags & ACE_INHERITANCE_FLAGS == 0,
@@ -428,15 +431,20 @@ fn verify_descriptor(
     user: PSID,
     require_protected: bool,
 ) -> Result<()> {
-    verify_descriptor_inner(descriptor, user, require_protected, true, false)
+    verify_descriptor_inner(descriptor, user, require_protected, true, false, false)
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "independent descriptor checks and narrow ACL candidates"
+)]
 fn verify_descriptor_inner(
     descriptor: PSECURITY_DESCRIPTOR,
     user: PSID,
     require_protected: bool,
     require_owner: bool,
     root_sibling_create_candidate: bool,
+    downloads_candidate: bool,
 ) -> Result<()> {
     // SAFETY: the descriptor is a live Windows-allocated security descriptor.
     let valid = unsafe { IsValidSecurityDescriptor(descriptor) }.as_bool();
@@ -496,6 +504,7 @@ fn verify_descriptor_inner(
             user,
             usize::from(header.AclSize),
             root_sibling_create_candidate,
+            downloads_candidate,
         )?;
     }
     Ok(())
@@ -521,7 +530,7 @@ pub fn verify_directory_acl(
 pub(crate) fn verify_private_file_acl(file: &File) -> Result<()> {
     ensure_not_impersonating()?;
     regular_file_identity(file)?;
-    inspect_object_acl(file, &process_user_sid()?, true, false)
+    inspect_object_acl(file, &process_user_sid()?, true, false, false)
 }
 
 /// Inspect an alleged volume-root ACL for the proposed sibling-creation case.
@@ -553,6 +562,7 @@ fn inspect_directory_acl(
         user_sid,
         require_protected,
         root_sibling_create_candidate,
+        false,
     )
 }
 
@@ -561,6 +571,7 @@ fn inspect_object_acl(
     user_sid: &[u8],
     require_protected: bool,
     root_sibling_create_candidate: bool,
+    downloads_candidate: bool,
 ) -> Result<()> {
     let mut user_words = sid_storage(user_sid)?;
     let user = PSID(user_words.as_mut_ptr().cast());
@@ -592,6 +603,7 @@ fn inspect_object_acl(
         require_protected,
         true,
         root_sibling_create_candidate,
+        downloads_candidate,
     )
 }
 
@@ -614,6 +626,8 @@ pub fn open_checked_child(
         name,
         allow_create,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        false,
+        false,
     )
 }
 
@@ -637,6 +651,79 @@ pub fn open_checked_child_without_delete_share(
         name,
         allow_create,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
+        false,
+        false,
+    )
+}
+
+/// Open the user's locally selected Downloads child without delete sharing.
+/// This tolerates only the limited Modify grants observed on Downloads; it
+/// does not prove effective rights, ancestry, or non-interference by other
+/// accounts, and is not by itself a publication qualification.
+pub(crate) fn open_downloads_guard(parent: &File, parent_id: FileIdentity) -> Result<File> {
+    open_checked_child_with_sharing(
+        parent,
+        parent_id,
+        "Downloads",
+        true,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        false,
+        true,
+    )
+}
+
+pub(crate) fn verify_downloads_candidate(directory: &File) -> Result<FileIdentity> {
+    ensure_not_impersonating()?;
+    let identity = directory_identity(directory)?;
+    inspect_object_acl(directory, &process_user_sid()?, false, false, true)?;
+    Ok(identity)
+}
+
+/// Retain the locally chosen profile directory with no delete sharing. The
+/// caller must bind this path to the user's approved profile and preserve the
+/// returned handle until the transaction ends; ancestor protection is not
+/// established by this leaf-only check.
+pub(crate) fn open_profile_guard(path: &std::path::Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    ensure!(path.is_absolute(), "profile path must be absolute");
+    ensure_not_impersonating()?;
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(
+            (FILE_LIST_DIRECTORY
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_READ_ATTRIBUTES
+                | FILE_TRAVERSE
+                | READ_CONTROL
+                | SYNCHRONIZE)
+                .0,
+        )
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    directory_identity(&directory)?;
+    verify_directory_acl(&directory, &process_user_sid()?, true)?;
+    Ok(directory)
+}
+
+/// Open the protected final child through the retained Downloads handle. The
+/// parent uses the limited Downloads ACL filter and the child must have a
+/// protected, restrictive descriptor. This does not authorize a receipt.
+pub(crate) fn open_downloads_final(
+    parent: &File,
+    parent_id: FileIdentity,
+    name: &str,
+) -> Result<File> {
+    open_checked_child_with_sharing(
+        parent,
+        parent_id,
+        name,
+        false,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        true,
+        false,
     )
 }
 
@@ -646,6 +733,8 @@ fn open_checked_child_with_sharing(
     name: &str,
     allow_create: bool,
     share_mode: FILE_SHARE_MODE,
+    parent_is_downloads: bool,
+    child_is_downloads: bool,
 ) -> Result<File> {
     ensure!(valid_component(name), "invalid directory component");
     ensure_not_impersonating()?;
@@ -654,7 +743,11 @@ fn open_checked_child_with_sharing(
         directory_identity(parent)? == expected_parent,
         "parent identity mismatch"
     );
-    verify_directory_acl(parent, &user, false)?;
+    if parent_is_downloads {
+        inspect_object_acl(parent, &user, false, false, true)?;
+    } else {
+        verify_directory_acl(parent, &user, false)?;
+    }
     let mut wide: Vec<u16> = name.encode_utf16().collect();
     let length = u16::try_from(
         wide.len()
@@ -738,7 +831,11 @@ fn open_checked_child_with_sharing(
         directory_identity(parent)? == expected_parent,
         "parent identity changed"
     );
-    verify_directory_acl(&child, &user, false)?;
+    if child_is_downloads {
+        inspect_object_acl(&child, &user, false, false, true)?;
+    } else {
+        verify_directory_acl(&child, &user, parent_is_downloads)?;
+    }
     Ok(child)
 }
 
@@ -956,7 +1053,7 @@ pub fn create_private_file(
             directory_identity(parent)? == expected_parent,
             "parent identity changed"
         );
-        inspect_object_acl(&file, &user, true, false)?;
+        inspect_object_acl(&file, &user, true, false, false)?;
         verify_directory_acl(parent, &user, true)?;
         Ok(())
     })();
@@ -1076,7 +1173,7 @@ pub(crate) fn reopen_private_file_no_share(
         directory_identity(parent)? == expected_parent,
         "parent identity changed"
     );
-    inspect_object_acl(&file, &user, true, false)?;
+    inspect_object_acl(&file, &user, true, false, false)?;
     verify_directory_acl(parent, &user, true)?;
     ExclusiveFile::from_opened_no_share(file)
 }
@@ -1427,6 +1524,43 @@ mod tests {
     }
 
     #[test]
+    fn downloads_candidate_rejects_child_delete_and_acl_control() {
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut words = sid_storage(&system_sid).unwrap();
+        let user = PSID(words.as_mut_ptr().cast());
+        let candidate = |sddl: &str| {
+            let value = descriptor(sddl);
+            verify_descriptor_inner(value.0, user, false, true, false, true)
+        };
+        candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x001301bf;;;WD)").unwrap();
+        for mask in ["0x40", "0x40000", "0x80000", "0x10000000"] {
+            let sddl = format!("O:SYG:SYD:P(A;;FA;;;SY)(A;;{mask};;;WD)");
+            assert!(candidate(&sddl).is_err(), "accepted {mask}");
+        }
+    }
+
+    #[test]
+    #[ignore = "read-only diagnostic of a selected profile and Downloads guard"]
+    fn selected_profile_and_downloads_guards_can_be_opened() {
+        let path = std::env::var_os("TEAMY_TEST_PROFILE").expect("select a profile");
+        let profile = open_profile_guard(std::path::Path::new(&path)).unwrap();
+        let profile_id = directory_identity(&profile).unwrap();
+        let downloads = open_downloads_guard(&profile, profile_id).unwrap();
+        let downloads_id = verify_downloads_candidate(&downloads).unwrap();
+        assert_eq!(profile_id.volume_serial, downloads_id.volume_serial);
+        assert_eq!(
+            crate::transfer::windows_lock::verify_ntfs_directory(&profile).unwrap(),
+            profile_id
+        );
+        assert_eq!(
+            crate::transfer::windows_lock::verify_ntfs_directory(&downloads).unwrap(),
+            downloads_id
+        );
+        crate::transfer::windows_streams::verify_directory_streams(&downloads, downloads_id)
+            .unwrap();
+    }
+
+    #[test]
     fn checked_child_no_delete_share_conflicts_with_delete_and_blocks_rename() {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("private-parent");
@@ -1491,7 +1625,7 @@ mod tests {
         let user = PSID(words.as_mut_ptr().cast());
         let candidate = |sddl: &str| {
             let descriptor = descriptor(sddl);
-            verify_descriptor_inner(descriptor.0, user, true, true, true)
+            verify_descriptor_inner(descriptor.0, user, true, true, true, false)
         };
         candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;;FR;;;WD)(A;;0x4;;;WD)").unwrap();
         candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;OICIIO;0xe0010000;;;AU)").unwrap();
@@ -1521,16 +1655,16 @@ mod tests {
         let mut words = sid_storage(&system_sid).unwrap();
         let user = PSID(words.as_mut_ptr().cast());
         let exact = descriptor(&format!("O:{SERVICE_SID}G:SYD:P(A;;FA;;;SY)"));
-        verify_descriptor_inner(exact.0, user, true, true, true).unwrap();
+        verify_descriptor_inner(exact.0, user, true, true, true, false).unwrap();
         assert!(verify_descriptor(exact.0, user, true).is_err());
         let altered = descriptor(
             "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465G:SYD:P(A;;FA;;;SY)",
         );
-        assert!(verify_descriptor_inner(altered.0, user, true, true, true).is_err());
+        assert!(verify_descriptor_inner(altered.0, user, true, true, true, false).is_err());
         let other_service = descriptor("O:S-1-5-80-1-2-3-4-5G:SYD:P(A;;FA;;;SY)");
-        assert!(verify_descriptor_inner(other_service.0, user, true, true, true).is_err());
+        assert!(verify_descriptor_inner(other_service.0, user, true, true, true, false).is_err());
         let grant = descriptor(&format!("O:{SERVICE_SID}G:SYD:P(A;;FA;;;{SERVICE_SID})"));
-        assert!(verify_descriptor_inner(grant.0, user, true, true, true).is_err());
+        assert!(verify_descriptor_inner(grant.0, user, true, true, true, false).is_err());
     }
 
     #[test]

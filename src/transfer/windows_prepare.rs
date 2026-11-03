@@ -14,10 +14,6 @@ use std::fs::File;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Owned resources remain together until journal initialization or inspection.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "awaiting receiver qualification wiring")
-)]
 #[derive(Debug)]
 pub(crate) struct PreparedFiles {
     pub(crate) work_parent: File,
@@ -25,22 +21,20 @@ pub(crate) struct PreparedFiles {
     pub(crate) stage: CreatedDirectory,
     pub(crate) journal: ExclusiveFile,
     pub(crate) files: BTreeMap<String, ExclusiveFile>,
+    pub(crate) retained: Vec<File>,
 }
 
 /// Create exclusively, never reusing or replacing an existing directory.
 /// On any failure, created entries are retained for inspection. A timeout or
 /// cancellation poisons the gate; the worker retains all handles while an I/O
 /// operation remains outstanding. This is not a qualification capability.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "awaiting receiver qualification wiring")
-)]
 pub(crate) async fn prepare_files(
     work_parent: File,
     expected_parent: FileIdentity,
     manifest: ApprovedManifest,
     gate: BlockingIoGate,
     budget: Duration,
+    retained: Vec<File>,
 ) -> Result<PreparedFiles> {
     ensure!(
         !budget.is_zero() && budget <= Duration::from_secs(30),
@@ -90,6 +84,7 @@ pub(crate) async fn prepare_files(
             stage,
             journal,
             files,
+            retained,
         })
     })
     .await
@@ -127,6 +122,7 @@ mod tests {
             manifest.clone(),
             BlockingIoGate::default(),
             Duration::from_secs(3),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -163,6 +159,7 @@ mod tests {
             manifest,
             BlockingIoGate::default(),
             Duration::from_secs(3),
+            Vec::new(),
         )
         .await
         .unwrap_err();

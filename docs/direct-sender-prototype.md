@@ -54,3 +54,24 @@ must match the configured pin. Never store the private key in the repository.
 Validation checks the manifest, TLS configuration and target, but does not
 qualify either directory or prove network access. Live receiving is still
 disabled until the separate publication and destination gates are completed.
+
+The gated one-shot integration expects `work_parent` to be the selected user's
+profile, `destination_parent` to be its `Downloads` child, and `final_name` to
+be `storytelling-recovery`. It retains no-delete-sharing profile and Downloads
+handles, creates a protected `storytelling-<transaction-id>` work directory in
+the profile, and keeps its journal outside Downloads. Publication uses a
+same-volume, no-replace rename, then checks the retained directory identity,
+exact file set, file identities, lengths, hashes and named streams. The
+receiver does not delete sources or alter the existing Downloads ACL.
+
+The Downloads ACL filter allows ordinary Modify grants that do not include
+delete-child, write-DACL or write-owner. The held guard blocks ordinary
+competing delete/rename opens, but it does not block attribute-only writes,
+prove that profile ancestors cannot be moved, or establish protection against
+hostile local principals. The operator's non-interference assumption for the
+dedicated stage applies during final publication. Verification reflects what
+was held and checked at that time; it is not a power-loss durability guarantee
+or a promise against changes after handles are released. A timeout or uncertain
+I/O requires local inspection before retrying. Unexpected pending opens retain
+their worker and resources until process termination and may prevent normal
+runtime shutdown. This integration remains behind the independent-review gate.

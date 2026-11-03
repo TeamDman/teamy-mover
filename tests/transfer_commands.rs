@@ -13,7 +13,7 @@ fn transfer_placeholders_refuse_to_run_and_do_not_create_files() {
             .unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("transfer is not yet available"));
-        assert_eq!(output.stdout, []);
+        assert_eq!(output.stdout, [0_u8; 0]);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
@@ -65,7 +65,7 @@ fn direct_sender_requires_local_approval_before_connecting() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("manifest file required"));
-    assert_eq!(result.stdout, []);
+    assert_eq!(result.stdout, [0_u8; 0]);
     assert_eq!(std::fs::read(&config).unwrap(), b"{}");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
@@ -116,6 +116,144 @@ fn receiver_command_rejects_incomplete_configuration_without_writes() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
+#[cfg(windows)]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercise a complete synthetic receiver configuration"
+)]
+fn receiver_command_validates_inputs_and_keeps_live_gate_closed() {
+    use facet::Facet;
+    use rcgen::{CertificateParams, KeyPair};
+    use std::fmt::Write as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Facet)]
+    struct Config {
+        version: u32,
+        manifest_file: String,
+        manifest_sha256: String,
+        transaction_id: String,
+        server_certificate_der: String,
+        server_key_der: String,
+        client_certificate_der: String,
+        server_sha256: String,
+        client_sha256: String,
+        target: String,
+        work_parent: String,
+        destination_parent: String,
+        final_name: String,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = CertificateParams::new(vec!["100.64.0.1".to_owned()])
+        .unwrap()
+        .self_signed(&server_key)
+        .unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = CertificateParams::new(vec!["client".to_owned()])
+        .unwrap()
+        .self_signed(&client_key)
+        .unwrap();
+    let key_path = dir.path().join("server.pk8");
+    let server_path = dir.path().join("server.der");
+    let client_path = dir.path().join("client.der");
+    std::fs::write(&key_path, server_key.serialize_der()).unwrap();
+    std::fs::write(&server_path, server_cert.der().as_ref()).unwrap();
+    std::fs::write(&client_path, client_cert.der().as_ref()).unwrap();
+    let sid = teamy_mover::transfer::windows_acl::process_user_sid().unwrap();
+    let authority = sid[2..8]
+        .iter()
+        .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte));
+    let mut sid_text = format!("S-{}-{authority}", sid[0]);
+    for part in sid[8..].chunks_exact(4) {
+        write!(
+            &mut sid_text,
+            "-{}",
+            u32::from_le_bytes(part.try_into().unwrap())
+        )
+        .unwrap();
+    }
+    let acl = Command::new("icacls")
+        .arg(&key_path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("*{sid_text}:(F)"))
+        .arg("*S-1-5-18:(F)")
+        .arg("*S-1-5-32-544:(F)")
+        .output()
+        .unwrap();
+    assert!(
+        acl.status.success(),
+        "failed to restrict synthetic key ACL: {}",
+        String::from_utf8_lossy(&acl.stderr)
+    );
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let transaction = "0123456789abcdef0123456789abcdef";
+    let hash = format!("{:x}", Sha256::digest(b"one"));
+    let manifest = format!(
+        r#"{{"aggregate_bytes":3,"expires_unix":{expiry},"file_count":1,"files":[{{"id":"one","name":"one.bin","sha256":"{hash}","size":3}}],"transaction_id":"{transaction}","version":1}}"#
+    );
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(&manifest_path, manifest.as_bytes()).unwrap();
+    let config = Config {
+        version: 1,
+        manifest_file: manifest_path.to_string_lossy().into_owned(),
+        manifest_sha256: format!("{:x}", Sha256::digest(manifest.as_bytes())),
+        transaction_id: transaction.to_owned(),
+        server_certificate_der: server_path.to_string_lossy().into_owned(),
+        server_key_der: key_path.to_string_lossy().into_owned(),
+        client_certificate_der: client_path.to_string_lossy().into_owned(),
+        server_sha256: format!("{:x}", Sha256::digest(server_cert.der().as_ref())),
+        client_sha256: format!("{:x}", Sha256::digest(client_cert.der().as_ref())),
+        target: "100.64.0.1:49152".to_owned(),
+        work_parent: dir.path().to_string_lossy().into_owned(),
+        destination_parent: dir.path().join("Downloads").to_string_lossy().into_owned(),
+        final_name: "storytelling-recovery".to_owned(),
+    };
+    let config_path = dir.path().join("receive.json");
+    std::fs::write(&config_path, facet_json::to_string(&config).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+        .args([
+            "--output-format",
+            "json",
+            "transfer",
+            "receive",
+            "--validate-only",
+            "--config-file",
+        ])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = String::from_utf8(output.stdout).unwrap();
+    assert!(summary.contains("\"valid\": true"));
+    assert!(summary.contains("\"receiver_started\": false"));
+    let live = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+        .args(["transfer", "receive", "--config-file"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(!live.status.success());
+    assert!(String::from_utf8_lossy(&live.stderr).contains("awaiting independent review"));
+    assert!(!dir.path().join("Downloads/storytelling-recovery").exists());
+    assert!(
+        !dir.path()
+            .join(format!("storytelling-{transaction}"))
+            .exists()
+    );
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest.as_bytes());
+}
+
 #[test]
 fn validate_manifest_checks_local_approval_without_modifying_input() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,7 +296,7 @@ fn validate_manifest_checks_local_approval_without_modifying_input() {
     assert!(output.contains("\"aggregate_bytes\": 5"));
     let bad = run(&"0".repeat(64));
     assert!(!bad.status.success());
-    assert_eq!(bad.stdout, []);
+    assert_eq!(bad.stdout, [0_u8; 0]);
     assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }

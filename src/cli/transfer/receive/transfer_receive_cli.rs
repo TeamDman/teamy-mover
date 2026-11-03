@@ -47,6 +47,34 @@ struct ValidationSummary {
 
 #[cfg(windows)]
 #[derive(Facet)]
+struct ReceiverSummary {
+    state: String,
+    source_deletion_attempted: bool,
+}
+
+#[cfg(windows)]
+struct ValidatedReceive {
+    config: ReceiveConfig,
+    manifest_bytes: Vec<u8>,
+    manifest: crate::transfer::manifest::ApprovedManifest,
+    target: crate::transfer::proxy::LocalDirectTarget,
+    endpoint: crate::transfer::tls::ServerEndpoint,
+}
+
+#[cfg(windows)]
+impl ValidatedReceive {
+    fn summary(&self) -> eyre::Result<ValidationSummary> {
+        Ok(ValidationSummary {
+            valid: true,
+            file_count: u64::try_from(self.manifest.files().len())?,
+            aggregate_bytes: self.manifest.aggregate_bytes(),
+            receiver_started: false,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Facet)]
 struct ProcessLimitSummary {
     process_memory_bytes: usize,
     job_configuration_verified: bool,
@@ -57,6 +85,17 @@ struct ProcessLimitSummary {
 impl TransferReceiveArgs {
     /// This check runs before runtime startup and grants no transfer capability.
     pub(crate) fn invoke_early(&self) -> eyre::Result<Option<crate::cli::output::CliOutput>> {
+        if !self.check_process_limit && self.config_file.is_some() && !self.validate_only {
+            #[cfg(windows)]
+            {
+                crate::transfer::windows_process_limit::apply_current_process_limit()?;
+                return Ok(None);
+            }
+            #[cfg(not(windows))]
+            {
+                eyre::bail!("receiver requires Windows");
+            }
+        }
         if !self.check_process_limit {
             return Ok(None);
         }
@@ -91,25 +130,24 @@ impl TransferReceiveArgs {
     ///
     /// # Errors
     /// Returns an error for unsafe inputs or an unavailable live qualification.
-    pub fn invoke(self) -> eyre::Result<crate::cli::output::CliOutput> {
+    pub async fn invoke(self) -> eyre::Result<crate::cli::output::CliOutput> {
         if self.config_file.is_none() && !self.validate_only {
             eyre::bail!("transfer is not yet available");
         }
         #[cfg(windows)]
         {
-            let summary = validate_config(
+            let validated = validate_config(
                 self.config_file
                     .as_deref()
                     .ok_or_else(|| eyre::eyre!("receiver configuration required"))?,
             )?;
-            eyre::ensure!(
-                self.validate_only,
-                "receiver publication qualification is unavailable"
-            );
-            Ok(crate::cli::output::CliOutput::facet(
-                summary,
-                Some(std::time::Duration::from_secs(3)),
-            ))
+            if self.validate_only {
+                return Ok(crate::cli::output::CliOutput::facet(
+                    validated.summary()?,
+                    Some(std::time::Duration::from_secs(3)),
+                ));
+            }
+            run_receiver(validated).await
         }
         #[cfg(not(windows))]
         {
@@ -119,7 +157,7 @@ impl TransferReceiveArgs {
 }
 
 #[cfg(windows)]
-fn validate_config(path: &str) -> eyre::Result<ValidationSummary> {
+fn validate_config(path: &str) -> eyre::Result<ValidatedReceive> {
     use crate::transfer::manifest::{MAX_MANIFEST_BYTES, parse_approved_manifest, valid_component};
     use crate::transfer::proxy::LocalDirectTarget;
     use crate::transfer::tls::ServerEndpoint;
@@ -210,12 +248,82 @@ fn validate_config(path: &str) -> eyre::Result<ValidationSummary> {
     let endpoint = ServerEndpoint::new(vec![client], vec![server], key, client_pin)?;
     let target = LocalDirectTarget::new(config.target.parse()?, server_pin, client_pin)?;
     target.check_server(target.bind_address(), &endpoint)?;
-    Ok(ValidationSummary {
-        valid: true,
-        file_count: u64::try_from(manifest.files().len())?,
-        aggregate_bytes: manifest.aggregate_bytes(),
-        receiver_started: false,
+    Ok(ValidatedReceive {
+        config,
+        manifest_bytes,
+        manifest,
+        target,
+        endpoint,
     })
+}
+
+#[cfg(windows)]
+async fn run_receiver(validated: ValidatedReceive) -> eyre::Result<crate::cli::output::CliOutput> {
+    use crate::transfer::receiver::{LocalOneShotApproval, Receiver, ReceiverSessionOutcome};
+    use crate::transfer::windows_acl::{open_downloads_guard, open_profile_guard};
+    use crate::transfer::windows_lock::verify_ntfs_directory;
+    use eyre::ensure;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    ensure!(
+        crate::transfer::windows_process_limit::is_current_process_limited(),
+        "receiver process limit was not applied before runtime startup"
+    );
+    // The reviewed post-rename verification gate remains closed before any
+    // destination mutation or listener until independent review completes.
+    crate::transfer::windows_publish::require_post_rename_file_verification()?;
+    let profile = PathBuf::from(
+        std::env::var_os("USERPROFILE").ok_or_else(|| eyre::eyre!("user profile unavailable"))?,
+    );
+    ensure!(
+        Path::new(&validated.config.work_parent) == profile,
+        "work parent must be the approved user profile"
+    );
+    ensure!(
+        Path::new(&validated.config.destination_parent) == profile.join("Downloads"),
+        "destination must be the approved Downloads directory"
+    );
+    ensure!(
+        validated.config.final_name == "storytelling-recovery",
+        "unexpected final directory"
+    );
+    let (profile, destination) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            let profile = open_profile_guard(&profile)?;
+            let id = verify_ntfs_directory(&profile)?;
+            let destination = open_downloads_guard(&profile, id)?;
+            ensure!(verify_ntfs_directory(&destination)?.volume_serial == id.volume_serial, "destination volume changed");
+            Ok::<_, eyre::Report>((profile, destination))
+        }),
+    )
+    .await???;
+    let input = LocalOneShotApproval {
+        manifest_bytes: validated.manifest_bytes,
+        manifest_sha256: validated.config.manifest_sha256,
+        transaction_id: validated.config.transaction_id,
+        client_pin: validated.config.client_sha256,
+        server_pin: validated.config.server_sha256,
+        final_name: validated.config.final_name,
+    };
+    let receiver = Receiver::prepare_local_one_shot(profile, destination, input).await?;
+    let outcome = receiver
+        .serve_once(&validated.target, &validated.endpoint)
+        .await?;
+    let state = match outcome {
+        ReceiverSessionOutcome::Incomplete => eyre::bail!("receiver closed before publication"),
+        ReceiverSessionOutcome::PublishedDurabilityUnconfirmed => {
+            "published-durability-unconfirmed"
+        }
+    };
+    Ok(crate::cli::output::CliOutput::facet(
+        ReceiverSummary {
+            state: state.to_owned(),
+            source_deletion_attempted: false,
+        },
+        Some(Duration::from_secs(30)),
+    ))
 }
 
 #[cfg(all(test, windows))]
@@ -228,8 +336,8 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn validates_receiver_inputs_without_creating_a_listener_or_stage() {
+    #[tokio::test]
+    async fn validates_receiver_inputs_without_creating_a_listener_or_stage() {
         let fixture = tempfile::tempdir().unwrap();
         let keys = create_synthetic_private_directory(&fixture.path().join("keys")).unwrap();
         let key_id = directory_identity(&keys).unwrap();
@@ -286,7 +394,10 @@ mod tests {
         };
         let config_path = fixture.path().join("receive.json");
         std::fs::write(&config_path, facet_json::to_string(&config).unwrap()).unwrap();
-        let summary = validate_config(config_path.to_str().unwrap()).unwrap();
+        let summary = validate_config(config_path.to_str().unwrap())
+            .unwrap()
+            .summary()
+            .unwrap();
         assert!(summary.valid);
         assert_eq!(summary.file_count, 1);
         assert_eq!(summary.aggregate_bytes, 3);
@@ -297,23 +408,25 @@ mod tests {
             config_file: Some(config_path.to_string_lossy().into_owned()),
             validate_only: true,
         };
-        let _validated = args.invoke().unwrap();
+        let _validated = args.invoke().await.unwrap();
         let live_args = TransferReceiveArgs {
             check_process_limit: false,
             config_file: Some(config_path.to_string_lossy().into_owned()),
             validate_only: false,
         };
-        let Err(gated) = live_args.invoke() else {
+        let Err(gated) = live_args.invoke().await else {
             panic!("live receiver must remain gated");
         };
-        assert!(gated.to_string().contains("qualification is unavailable"));
+        assert!(gated.to_string().contains("receiver process limit"));
         assert!(!fixture.path().join("storytelling-recovery").exists());
         let bad_config = ReceiveConfig {
             client_sha256: "0".repeat(64),
             ..config
         };
         std::fs::write(&config_path, facet_json::to_string(&bad_config).unwrap()).unwrap();
-        let _rejected = validate_config(config_path.to_str().unwrap()).unwrap_err();
+        let Err(_rejected) = validate_config(config_path.to_str().unwrap()) else {
+            panic!("invalid pin must be rejected");
+        };
         assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest.as_bytes());
         assert!(!fixture.path().join("storytelling-recovery").exists());
     }

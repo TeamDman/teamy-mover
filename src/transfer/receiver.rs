@@ -151,6 +151,16 @@ pub(crate) enum ReceiverSessionOutcome {
     PublishedDurabilityUnconfirmed,
 }
 
+#[derive(Clone)]
+pub(crate) struct LocalOneShotApproval {
+    pub(crate) manifest_bytes: Vec<u8>,
+    pub(crate) manifest_sha256: String,
+    pub(crate) transaction_id: String,
+    pub(crate) client_pin: String,
+    pub(crate) server_pin: String,
+    pub(crate) final_name: String,
+}
+
 impl std::fmt::Debug for Receiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Receiver").finish_non_exhaustive()
@@ -177,6 +187,126 @@ fn check(state: &State, transaction: &str, digest: &str) -> std::result::Result<
 }
 
 impl Receiver {
+    /// Construct the approved one-shot stage and journal under retained local
+    /// directory guards. This assumes ordinary local processes do not tamper
+    /// with the dedicated stage; it does not claim hostile-user isolation.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep transaction handles together through initialization"
+    )]
+    pub(crate) async fn prepare_local_one_shot(
+        profile: std::fs::File,
+        destination: std::fs::File,
+        input: LocalOneShotApproval,
+    ) -> Result<Self> {
+        use super::journal::ObjectIdentity;
+        use super::windows_lock::directory_identity;
+        use super::windows_prepare::{PreparedFiles, prepare_files};
+
+        ensure!(
+            input.final_name == "storytelling-recovery",
+            "unexpected final directory"
+        );
+        let manifest = parse_approved_manifest(
+            &input.manifest_bytes,
+            &input.manifest_sha256,
+            &input.transaction_id,
+            now()?,
+        )?;
+
+        let object = |id: super::windows_lock::FileIdentity| ObjectIdentity {
+            volume_serial: id.volume_serial,
+            file_index: id.file_index,
+        };
+        let gate = BlockingIoGate::default();
+        let opening_gate = gate.clone();
+        let (profile, profile_id, destination, destination_id, retained) = gate
+            .run(MAX_IDLE, move || {
+                opening_gate.ensure_active()?;
+                let profile_id = directory_identity(&profile)?;
+                let destination_id = directory_identity(&destination)?;
+                ensure!(
+                    profile_id.volume_serial == destination_id.volume_serial,
+                    "profile and destination must be on one volume"
+                );
+                let retained = vec![destination.try_clone()?];
+                opening_gate.ensure_active()?;
+                Ok((profile, profile_id, destination, destination_id, retained))
+            })
+            .await?;
+        let prepared = prepare_files(
+            profile,
+            profile_id,
+            manifest,
+            gate.clone(),
+            MAX_IDLE,
+            retained,
+        )
+        .await?;
+        let dest_id = object(destination_id);
+        let manifest_bytes = input.manifest_bytes.clone();
+        let manifest_sha256 = input.manifest_sha256.clone();
+        let transaction_id = input.transaction_id.clone();
+        let client_pin = input.client_pin.clone();
+        let server_pin = input.server_pin.clone();
+        let final_name = input.final_name.clone();
+        let worker_gate = gate.clone();
+        let (journal, publication, files, stage_id, journal_id) = gate
+            .run(MAX_IDLE, move || {
+                worker_gate.ensure_active()?;
+                let PreparedFiles {
+                    work_parent,
+                    work_root,
+                    stage,
+                    journal,
+                    files,
+                    retained,
+                } = prepared;
+                let stage_id = object(directory_identity(&stage)?);
+                let journal_id = object(journal.identity());
+                worker_gate.ensure_active()?;
+                let approval = JournalApproval {
+                    manifest_bytes: &manifest_bytes,
+                    manifest_sha256: &manifest_sha256,
+                    transaction_id: &transaction_id,
+                    client_pin: &client_pin,
+                    server_pin: &server_pin,
+                    destination_parent: dest_id,
+                    stage_directory: stage_id,
+                    journal_file: journal_id,
+                    final_name: &final_name,
+                    now_unix: now()?,
+                };
+                let journal = TransactionJournal::initialize(journal, &approval)?;
+                worker_gate.ensure_active()?;
+                let mut ancestry = vec![work_parent, work_root.try_clone()?];
+                ancestry.extend(retained);
+                let publication = PublicationQualification::practical(
+                    stage,
+                    destination,
+                    ancestry,
+                    &final_name,
+                    worker_gate.clone(),
+                )?;
+                worker_gate.ensure_active()?;
+                Ok((journal, publication, files, stage_id, journal_id))
+            })
+            .await?;
+        let approval = JournalApproval {
+            manifest_bytes: &input.manifest_bytes,
+            manifest_sha256: &input.manifest_sha256,
+            transaction_id: &input.transaction_id,
+            client_pin: &input.client_pin,
+            server_pin: &input.server_pin,
+            destination_parent: dest_id,
+            stage_directory: stage_id,
+            journal_file: journal_id,
+            final_name: &input.final_name,
+            now_unix: now()?,
+        };
+        Self::prepare_for_commit(StagingPermit(()), journal, &approval, files, publication).await
+    }
+
     /// Prepare pre-existing exclusively held files and journal their claims
     /// in a deadline-bounded blocking worker. After timeout or cancellation,
     /// the worker may still hold its handles and its on-disk outcome requires
@@ -195,10 +325,6 @@ impl Receiver {
 
     /// Prepare a receiver with a separately qualified publication capability.
     /// No operational staging or publication constructor exists yet.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "awaiting the reviewed qualification constructor")
-    )]
     pub(crate) async fn prepare_for_commit(
         permit: StagingPermit,
         journal: TransactionJournal,
@@ -365,13 +491,6 @@ impl Receiver {
     /// Accept exactly one connection at the approved tailnet address. The
     /// caller still needs a separately qualified staging/publication permit;
     /// closure or timeout does not prove peer receipt or durable publication.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "awaiting an operational qualification constructor"
-        )
-    )]
     pub(crate) async fn serve_once(
         self,
         target: &super::proxy::LocalDirectTarget,
@@ -1067,6 +1186,195 @@ mod tests {
         );
         assert!(!control.started.load(Ordering::Acquire));
         assert_eq!(std::fs::read(&fixture.source).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn local_one_shot_prepares_private_files_and_refuses_duplicate() {
+        use crate::transfer::windows_acl::{
+            create_private_child, create_synthetic_private_directory, open_downloads_guard,
+            open_profile_guard,
+        };
+        use crate::transfer::windows_lock::directory_identity;
+        let fixture = tempfile::tempdir().unwrap();
+        let profile_path = fixture.path().join("profile");
+        let initial = create_synthetic_private_directory(&profile_path).unwrap();
+        let profile_id = directory_identity(&initial).unwrap();
+        let downloads = create_private_child(&initial, profile_id, "Downloads").unwrap();
+        drop(downloads);
+        drop(initial);
+        let profile = open_profile_guard(&profile_path).unwrap();
+        let destination = open_downloads_guard(&profile, profile_id).unwrap();
+        let expiry = now().unwrap() + 600;
+        let hash = format!("{:x}", Sha256::digest(b"one"));
+        let raw = format!(
+            r#"{{"aggregate_bytes":3,"expires_unix":{expiry},"file_count":1,"files":[{{"id":"one","name":"one.bin","sha256":"{hash}","size":3}}],"transaction_id":"{ID}","version":1}}"#
+        );
+        let (_, _, client_pin, server_pin) = certificates();
+        let approval = LocalOneShotApproval {
+            manifest_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+            manifest_bytes: raw.into_bytes(),
+            transaction_id: ID.to_owned(),
+            client_pin,
+            server_pin,
+            final_name: "storytelling-recovery".to_owned(),
+        };
+        let receiver = Receiver::prepare_local_one_shot(profile, destination, approval.clone())
+            .await
+            .unwrap();
+        let state = receiver.state.lock().await;
+        assert!(state.publication.is_some());
+        assert!(state.journal.is_some());
+        assert_eq!(state.files.len(), 1);
+        assert!(!state.in_flight_or_failed);
+        drop(state);
+        let duplicate_profile = open_profile_guard(&profile_path).unwrap();
+        let duplicate_dest = open_downloads_guard(&duplicate_profile, profile_id).unwrap();
+        let _collision =
+            Receiver::prepare_local_one_shot(duplicate_profile, duplicate_dest, approval)
+                .await
+                .unwrap_err();
+        assert!(
+            !profile_path
+                .join("Downloads/storytelling-recovery")
+                .exists()
+        );
+        assert!(
+            profile_path
+                .join(format!("storytelling-{ID}/payload/one.bin"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual synthetic profile, NTFS rename and loopback TCP test"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise the complete one-shot transfer"
+    )]
+    async fn local_one_shot_constructs_and_transfers_over_loopback() {
+        use crate::transfer::windows_acl::{
+            create_private_child, create_synthetic_private_directory, open_downloads_guard,
+            open_profile_guard,
+        };
+        use crate::transfer::windows_lock::directory_identity;
+        let fixture = tempfile::tempdir().unwrap();
+        let profile_path = fixture.path().join("profile");
+        let initial = create_synthetic_private_directory(&profile_path).unwrap();
+        let profile_id = directory_identity(&initial).unwrap();
+        let downloads = create_private_child(&initial, profile_id, "Downloads").unwrap();
+        drop(downloads);
+        let acl = std::process::Command::new("icacls")
+            .arg(profile_path.join("Downloads"))
+            .args(["/grant", "*S-1-1-0:(OI)(CI)(M)"])
+            .output()
+            .unwrap();
+        assert!(
+            acl.status.success(),
+            "failed to set synthetic Downloads ACL: {}",
+            String::from_utf8_lossy(&acl.stderr)
+        );
+        drop(initial);
+        let profile = open_profile_guard(&profile_path).unwrap();
+        let destination = open_downloads_guard(&profile, profile_id).unwrap();
+        let expiry = now().unwrap() + 600;
+        let bodies: [&[u8]; 3] = [b"one", b"two", b"three"];
+        let ids = ["one", "two", "three"];
+        let mut sources = Vec::new();
+        let mut entries = Vec::new();
+        for (id, body) in ids.iter().zip(bodies) {
+            let path = fixture.path().join(format!("source-{id}"));
+            std::fs::write(&path, body).unwrap();
+            sources.push(Source::from_file(
+                (*id).to_owned(),
+                File::open(&path).unwrap(),
+            ));
+            let hash = format!("{:x}", Sha256::digest(body));
+            entries.push(format!(
+                r#"{{"id":"{id}","name":"{id}.bin","sha256":"{hash}","size":{}}}"#,
+                body.len()
+            ));
+        }
+        let raw = format!(
+            r#"{{"aggregate_bytes":11,"expires_unix":{expiry},"file_count":3,"files":[{}],"transaction_id":"{ID}","version":1}}"#,
+            entries.join(",")
+        );
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        let (client, server, client_pin, server_pin) = certificates();
+        let approval = LocalOneShotApproval {
+            manifest_bytes: raw.as_bytes().to_vec(),
+            manifest_sha256: digest.clone(),
+            transaction_id: ID.to_owned(),
+            client_pin,
+            server_pin,
+            final_name: "storytelling-recovery".to_owned(),
+        };
+        let receiver = Receiver::prepare_local_one_shot(profile, destination, approval)
+            .await
+            .unwrap();
+        let control = receiver.clone();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(address) = reservation.local_addr().unwrap() else {
+            panic!("IPv4 required")
+        };
+        drop(reservation);
+        let (server_pin, client_pin) = server.pins();
+        let target = crate::transfer::proxy::LocalDirectTarget::synthetic_loopback(
+            address, server_pin, client_pin,
+        )
+        .unwrap();
+        let server_task = tokio::spawn(async move { receiver.serve_once(&target, &server).await });
+        let socket = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tokio::net::TcpStream::connect(address).await {
+                    Ok(socket) => break socket,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let authenticated = client.connect(socket).await.unwrap();
+        let connection = vox_transport::establish_client(authenticated)
+            .await
+            .unwrap();
+        let outcome = crate::transfer::sender::send_approved_and_commit(
+            &connection,
+            raw.as_bytes(),
+            &digest,
+            ID,
+            sources,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TransferState::PublishedDurabilityUnconfirmed);
+        connection.shutdown().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("receiver shutdown not observed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReceiverSessionOutcome::PublishedDurabilityUnconfirmed
+        );
+        let mut guard = control.state.lock().await;
+        let retained = guard.published_handles.as_mut().unwrap();
+        for (id, body) in ids.iter().zip(bodies) {
+            let file = retained.files.get_mut(*id).unwrap().file_mut();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut actual = Vec::new();
+            file.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, body);
+            assert_eq!(
+                std::fs::read(fixture.path().join(format!("source-{id}"))).unwrap(),
+                body
+            );
+        }
+        assert!(
+            profile_path
+                .join("Downloads/storytelling-recovery")
+                .is_dir()
+        );
     }
 
     #[tokio::test]

@@ -61,7 +61,10 @@ impl Cli {
         let direct_sender = matches!(&self.command, Command::Transfer(transfer)
             if matches!(&transfer.command, transfer::TransferCommand::Send(args)
                 if args.connect_config.is_some() && !args.verify_only));
-        let mut builder = if direct_sender {
+        let direct_receiver = matches!(&self.command, Command::Transfer(transfer)
+            if matches!(&transfer.command, transfer::TransferCommand::Receive(args)
+                if args.config_file.is_some() && !args.validate_only));
+        let mut builder = if direct_sender || direct_receiver {
             tokio::runtime::Builder::new_current_thread()
         } else {
             tokio::runtime::Builder::new_multi_thread()

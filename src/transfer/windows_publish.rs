@@ -8,7 +8,7 @@ use super::blocking_io::BlockingIoGate;
 use super::journal::{JournalBinding, ObjectIdentity};
 use super::manifest::valid_component;
 use super::transaction_journal::TransactionJournal;
-use super::windows_acl::{CreatedDirectory, open_checked_child};
+use super::windows_acl::{CreatedDirectory, open_downloads_final};
 use super::windows_lock::{ExclusiveFile, directory_identity};
 use eyre::{Result, ensure};
 use std::collections::BTreeMap;
@@ -50,6 +50,47 @@ pub(crate) struct PublicationQualification {
 }
 
 impl PublicationQualification {
+    /// Bind the one-shot profile and Downloads handles produced by the local
+    /// guard code to the newly created protected stage. This practical path
+    /// assumes ordinary local processes do not tamper with the dedicated stage;
+    /// it does not claim hostile-local-user isolation or crash durability.
+    pub(crate) fn practical(
+        stage: CreatedDirectory,
+        destination_parent: File,
+        ancestry: Vec<File>,
+        final_name: &str,
+        gate: BlockingIoGate,
+    ) -> Result<Self> {
+        ensure!(
+            final_name == "storytelling-recovery",
+            "unexpected final directory"
+        );
+        ensure!(
+            ancestry.len() >= 2 && ancestry.len() <= 64,
+            "invalid retained ancestry"
+        );
+        let parent_id = super::windows_acl::verify_downloads_candidate(&destination_parent)?;
+        let stage_id = directory_identity(&stage)?;
+        ensure!(
+            parent_id.volume_serial == stage_id.volume_serial,
+            "stage and destination are on different volumes"
+        );
+        super::windows_acl::verify_directory_acl(
+            &stage,
+            &super::windows_acl::process_user_sid()?,
+            true,
+        )?;
+        super::windows_streams::verify_directory_streams(&destination_parent, parent_id)?;
+        super::windows_streams::verify_directory_streams(&stage, stage_id)?;
+        Ok(Self {
+            permit: PublicationPermit(gate),
+            stage,
+            destination_parent,
+            ancestry,
+            final_name: final_name.to_owned(),
+        })
+    }
+
     /// Use the same single-flight gate for staging and publication. This does
     /// not create or qualify the permit.
     pub(crate) fn gate(&self) -> BlockingIoGate {
@@ -139,7 +180,7 @@ fn observed_publication(
 ) -> Result<ObservedPublication> {
     let parent_id = directory_identity(parent)?;
     let stage_id = directory_identity(stage)?;
-    let published = open_checked_child(parent, parent_id, name, false)?;
+    let published = open_downloads_final(parent, parent_id, name)?;
     ensure!(
         directory_identity(&published)? == stage_id,
         "published identity does not match stage"
@@ -261,7 +302,7 @@ struct RetainedDestination {
         reason = "production receipt gate stays closed"
     )
 )]
-fn require_post_rename_file_verification() -> Result<()> {
+pub(crate) fn require_post_rename_file_verification() -> Result<()> {
     #[cfg(not(test))]
     eyre::bail!("post-rename verification is awaiting independent review");
     #[cfg(test)]

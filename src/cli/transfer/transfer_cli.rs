@@ -32,7 +32,7 @@ impl TransferArgs {
         match self.command {
             TransferCommand::ValidateManifest(args) => args.invoke(),
             TransferCommand::Send(args) => args.invoke().await,
-            TransferCommand::Receive(args) => args.invoke(),
+            TransferCommand::Receive(args) => args.invoke().await,
         }
     }
 }
