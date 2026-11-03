@@ -1,0 +1,1569 @@
+diff --git a/rust/vox-core/src/connection/channel_gate_lifecycle.rs b/rust/vox-core/src/connection/channel_gate_lifecycle.rs
+new file mode 100644
+index 00000000..cf25b6de
+--- /dev/null
++++ b/rust/vox-core/src/connection/channel_gate_lifecycle.rs
+@@ -0,0 +1,137 @@
++//! A one-shot channel declaration outcome. Live sends use the persistent wake
++//! mechanism; failure outcomes are not yet connected to their error paths.
++//!
++//! Owners must retain the gate for the lifetime of each sender and bind it to
++//! the originating lane generation. A lookup that treats a reclaimed failed
++//! gate as open would reintroduce undeclared channel sends.
++
++use std::sync::Mutex;
++use vox_rt::sync::watch;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum GateState {
++    Pending,
++    Open,
++    Failed,
++}
++
++pub(crate) struct ChannelDeclarationGate {
++    state: Mutex<GateState>,
++    changed_tx: watch::Sender<GateState>,
++    changed_rx: watch::Receiver<GateState>,
++}
++
++impl ChannelDeclarationGate {
++    pub(crate) fn new() -> Self {
++        let (changed_tx, changed_rx) = watch::channel(GateState::Pending);
++        Self {
++            state: Mutex::new(GateState::Pending),
++            changed_tx,
++            changed_rx,
++        }
++    }
++
++    /// Complete exactly once. Opening is allowed only after the declaring call
++    /// is enqueued; cancellation, preparation failure and lane closure fail it.
++    pub(crate) fn finish(&self, outcome: GateState) -> bool {
++        assert_ne!(outcome, GateState::Pending);
++        let mut state = self.state.lock().expect("channel gate mutex poisoned");
++        if *state != GateState::Pending {
++            return false;
++        }
++        *state = outcome;
++        // Keep a receiver in the gate so native watch::Sender::send cannot fail
++        // merely because there are temporarily no channel send waiters.
++        let _ = self.changed_tx.send(outcome);
++        true
++    }
++
++    pub(crate) fn state(&self) -> GateState {
++        *self.state.lock().expect("channel gate mutex poisoned")
++    }
++
++    /// The watch value persists for late and concurrent waiters, avoiding a
++    /// lost notification between checking state and registering to wake.
++    pub(crate) async fn wait(&self) -> Result<(), ()> {
++        let mut changed = self.changed_rx.clone();
++        loop {
++            match *changed.borrow() {
++                GateState::Open => return Ok(()),
++                GateState::Failed => return Err(()),
++                GateState::Pending => {}
++            }
++            changed.changed().await.map_err(|_| ())?;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Arc;
++    use std::time::Duration;
++
++    #[tokio::test]
++    async fn failure_wakes_all_waiters_and_late_waiters_cannot_send() {
++        let gate = Arc::new(ChannelDeclarationGate::new());
++        let mut first = Box::pin(gate.wait());
++        let mut second = Box::pin(gate.wait());
++        assert!(matches!(
++            futures_util::poll!(&mut first),
++            std::task::Poll::Pending
++        ));
++        assert!(matches!(
++            futures_util::poll!(&mut second),
++            std::task::Poll::Pending
++        ));
++        assert!(gate.finish(GateState::Failed));
++        assert!(!gate.finish(GateState::Open));
++        assert!(
++            tokio::time::timeout(Duration::from_secs(2), first)
++                .await
++                .unwrap()
++                .is_err()
++        );
++        assert!(
++            tokio::time::timeout(Duration::from_secs(2), second)
++                .await
++                .unwrap()
++                .is_err()
++        );
++        assert!(gate.wait().await.is_err());
++        assert_eq!(gate.state(), GateState::Failed);
++    }
++
++    #[tokio::test]
++    async fn successful_declaration_opens_once_for_existing_and_late_waiters() {
++        let gate = Arc::new(ChannelDeclarationGate::new());
++        let waiter = {
++            let gate = gate.clone();
++            tokio::spawn(async move { gate.wait().await })
++        };
++        assert!(gate.finish(GateState::Open));
++        assert!(!gate.finish(GateState::Failed));
++        assert!(
++            tokio::time::timeout(Duration::from_secs(2), waiter)
++                .await
++                .unwrap()
++                .unwrap()
++                .is_ok()
++        );
++        assert!(gate.wait().await.is_ok());
++    }
++
++    #[tokio::test]
++    async fn transition_between_check_and_wait_is_not_lost() {
++        let gate = ChannelDeclarationGate::new();
++        let mut receiver = gate.changed_rx.clone();
++        assert_eq!(*receiver.borrow(), GateState::Pending);
++        assert!(gate.finish(GateState::Open));
++        // No `changed` future existed at the instant of the transition.
++        tokio::time::timeout(Duration::from_secs(2), receiver.changed())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(*receiver.borrow(), GateState::Open);
++    }
++}
+diff --git a/rust/vox-core/src/connection/mod.rs b/rust/vox-core/src/connection/mod.rs
+index 556d4377..4b6b5c7a 100644
+--- a/rust/vox-core/src/connection/mod.rs
++++ b/rust/vox-core/src/connection/mod.rs
+@@ -9,7 +9,7 @@ use std::{
+ use facet_core::Shape;
+ use futures_util::FutureExt as _;
+ use tracing::{trace, warn};
+-use vox_rt::sync::{Notify, mpsc, oneshot, watch};
++use vox_rt::sync::{mpsc, oneshot, watch};
+ use vox_types::time::Instant;
+ use vox_types::{
+     BoxFut, ChannelMessage, ConduitRx, ConduitTx, ConnectionRole, ConnectionSettings, Decline,
+@@ -25,7 +25,13 @@ use vox_types::{
+ };
+ 
+ mod builders;
++// Failure outcomes are implemented but not yet wired to live callers.
++pub(crate) mod channel_gate_lifecycle;
++// Request-identity primitives are not wired to outbound traffic yet.
++#[allow(dead_code)]
++mod response_reservation;
+ pub use builders::*;
++use channel_gate_lifecycle::{ChannelDeclarationGate, GateState};
+ 
+ /// Connection-level protocol keepalive configuration.
+ #[derive(Debug, Clone, Copy)]
+@@ -1472,7 +1478,7 @@ impl Connection {
+             observer: observer.clone(),
+             channel_gates: std::sync::Mutex::new(HashMap::new()),
+         });
+-        let outbound_abort = spawn_outbound_worker(outbound_rx);
++        let outbound_abort = spawn_outbound_worker(outbound_rx, control_tx.clone());
+         Connection {
+             rx: Box::new(rx),
+             role: ConnectionRole::Initiator, // overwritten in establish_as_*
+@@ -2906,11 +2912,6 @@ impl Connection {
+ /// the application fires concurrently with the call cannot reach the wire before the
+ /// Call that declares the channel — the sender upholds the frame-ordering invariant
+ /// (`r[impl rpc.channel.item]`).
+-struct ChannelGate {
+-    opened: std::sync::atomic::AtomicBool,
+-    notify: Notify,
+-}
+-
+ pub(crate) struct ConnectionCore {
+     inner: std::sync::Mutex<ConnectionCoreInner>,
+     outbound_tx: mpsc::Sender<OutboundBatch>,
+@@ -2923,7 +2924,9 @@ pub(crate) struct ConnectionCore {
+     observer: Option<VoxObserverHandle>,
+     /// Open gates for channels the local side opened but whose declaring Call has not
+     /// yet been enqueued. Channel IDs are allocated per lane, so both are needed.
+-    channel_gates: std::sync::Mutex<HashMap<(LaneId, vox_types::ChannelId), Arc<ChannelGate>>>,
++    channel_gates: std::sync::Mutex<
++        HashMap<(LaneId, vox_types::ChannelId), std::sync::Weak<ChannelDeclarationGate>>,
++    >,
+ }
+ 
+ pub trait OutboundSendFuture: Future<Output = std::io::Result<()>> + MaybeSend + 'static {}
+@@ -2966,13 +2969,115 @@ type PreparedOutboundBatch = (
+     OutboundBatch,
+     oneshot::Receiver<std::io::Result<()>>,
+     Vec<vox_types::ChannelId>,
++    DeclaredChannelGuard,
+ );
+ 
+ struct PrepareOutboundError {
+     gated_channels: Vec<vox_types::ChannelId>,
++    gate_guard: DeclaredChannelGuard,
++}
++
++/// Retains declaring gates through admission. Failure or cancellation before
++/// queue commit makes each still-live channel terminal instead of opening it.
++struct DeclaredChannelGuard {
++    gates: Vec<Arc<ChannelDeclarationGate>>,
++    committed: bool,
++}
++
++std::thread_local! {
++    // Encoding is synchronous. The stack preserves nested encodes and lets an
++    // unwinding scope fail gates even before the channel collector returns IDs.
++    static DECLARATION_CAPTURES: std::cell::RefCell<Vec<DeclarationCaptureFrame>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++struct DeclarationCaptureFrame {
++    core: usize,
++    lane_id: LaneId,
++    gates: Vec<Arc<ChannelDeclarationGate>>,
++}
++
++struct DeclarationCapture {
++    active: bool,
++}
++
++impl DeclarationCapture {
++    fn begin(core: &ConnectionCore, lane_id: LaneId) -> Self {
++        let frame = DeclarationCaptureFrame {
++            core: std::ptr::from_ref(core) as usize,
++            lane_id,
++            gates: Vec::new(),
++        };
++        DECLARATION_CAPTURES.with(|captures| captures.borrow_mut().push(frame));
++        Self { active: true }
++    }
++
++    fn record(core: &ConnectionCore, lane_id: LaneId, gate: &Arc<ChannelDeclarationGate>) {
++        DECLARATION_CAPTURES.with(|captures| {
++            if let Some(current) = captures.borrow_mut().last_mut() {
++                if current.core == std::ptr::from_ref(core) as usize && current.lane_id == lane_id {
++                    current.gates.push(Arc::clone(gate));
++                }
++            }
++        });
++    }
++
++    fn finish(mut self) -> DeclaredChannelGuard {
++        let gates = DECLARATION_CAPTURES.with(|captures| {
++            captures
++                .borrow_mut()
++                .pop()
++                .expect("declaration capture stack")
++                .gates
++        });
++        self.active = false;
++        DeclaredChannelGuard {
++            gates,
++            committed: false,
++        }
++    }
++}
++
++impl Drop for DeclarationCapture {
++    fn drop(&mut self) {
++        if self.active {
++            let gates = DECLARATION_CAPTURES.with(|captures| {
++                captures
++                    .borrow_mut()
++                    .pop()
++                    .expect("declaration capture stack")
++                    .gates
++            });
++            drop(DeclaredChannelGuard {
++                gates,
++                committed: false,
++            });
++        }
++    }
+ }
+ 
+-async fn run_outbound_worker(mut rx: mpsc::Receiver<OutboundBatch>) {
++impl DeclaredChannelGuard {
++    fn open(mut self) {
++        for gate in &self.gates {
++            gate.finish(GateState::Open);
++        }
++        self.committed = true;
++    }
++}
++
++impl Drop for DeclaredChannelGuard {
++    fn drop(&mut self) {
++        if !self.committed {
++            for gate in &self.gates {
++                gate.finish(GateState::Failed);
++            }
++        }
++    }
++}
++
++async fn run_outbound_worker(
++    mut rx: mpsc::Receiver<OutboundBatch>,
++    control_tx: mpsc::UnboundedSender<DropControlRequest>,
++) {
+     while let Some(batch) = rx.recv().await {
+         // Only a batch accepted by the queue can become an in-flight call. Do
+         // this before writing either its schema or its request to the transport,
+@@ -3076,15 +3181,34 @@ async fn run_outbound_worker(mut rx: mpsc::Receiver<OutboundBatch>) {
+             ok = result.is_ok(),
+             "connection outbound worker finished batch"
+         );
++        let failed = result.is_err();
++        if failed {
++            // A write error may represent a partial frame. Never send later
++            // queued batches on this worker after such an uncertain outcome.
++            // `abort` is best effort and is not proof of transport teardown.
++            batch.tx.abort();
++            // Ask the connection driver to retire the lane state and attempt
++            // teardown. A driver stalled in a handler may not observe this yet.
++            let _ = send_drop_control(&control_tx, DropControlRequest::ResourceClose);
++        }
+         let _ = batch.result_tx.send(result);
++        if failed {
++            // Dropping the receiver fails queued results and capacity waiters.
++            break;
++        }
+     }
+ }
+ 
+ #[cfg(not(target_arch = "wasm32"))]
+-fn spawn_outbound_worker(rx: mpsc::Receiver<OutboundBatch>) -> futures_util::future::AbortHandle {
++fn spawn_outbound_worker(
++    rx: mpsc::Receiver<OutboundBatch>,
++    control_tx: mpsc::UnboundedSender<DropControlRequest>,
++) -> futures_util::future::AbortHandle {
+     let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+     let worker = async move {
+-        let _ = futures_util::future::Abortable::new(run_outbound_worker(rx), registration).await;
++        let _ =
++            futures_util::future::Abortable::new(run_outbound_worker(rx, control_tx), registration)
++                .await;
+     };
+     if tokio::runtime::Handle::try_current().is_ok() {
+         tokio::spawn(worker);
+@@ -3102,10 +3226,15 @@ fn spawn_outbound_worker(rx: mpsc::Receiver<OutboundBatch>) -> futures_util::fut
+ }
+ 
+ #[cfg(target_arch = "wasm32")]
+-fn spawn_outbound_worker(rx: mpsc::Receiver<OutboundBatch>) -> futures_util::future::AbortHandle {
++fn spawn_outbound_worker(
++    rx: mpsc::Receiver<OutboundBatch>,
++    control_tx: mpsc::UnboundedSender<DropControlRequest>,
++) -> futures_util::future::AbortHandle {
+     let (abort, registration) = futures_util::future::AbortHandle::new_pair();
+     wasm_bindgen_futures::spawn_local(async move {
+-        let _ = futures_util::future::Abortable::new(run_outbound_worker(rx), registration).await;
++        let _ =
++            futures_util::future::Abortable::new(run_outbound_worker(rx, control_tx), registration)
++                .await;
+     });
+     abort
+ }
+@@ -3210,21 +3339,34 @@ impl ConnectionCore {
+     /// the channel binder at allocation time (during a Call's arg-encode), BEFORE the
+     /// Tx sink is bound — so a concurrently-parked `tx.send` that wakes on the bind
+     /// finds the gate and waits. Idempotent. (`r[impl rpc.channel.item]`)
+-    pub(crate) fn register_channel_gate(&self, lane_id: LaneId, channel_id: vox_types::ChannelId) {
+-        self.channel_gates
++    pub(crate) fn register_channel_gate(
++        &self,
++        lane_id: LaneId,
++        channel_id: vox_types::ChannelId,
++    ) -> Arc<ChannelDeclarationGate> {
++        let mut gates = self
++            .channel_gates
+             .lock()
+-            .expect("channel gates mutex poisoned")
+-            .entry((lane_id, channel_id))
+-            .or_insert_with(|| {
+-                Arc::new(ChannelGate {
+-                    opened: std::sync::atomic::AtomicBool::new(false),
+-                    notify: Notify::new("connection.channel_gate"),
+-                })
+-            });
++            .expect("channel gates mutex poisoned");
++        gates.retain(|_, gate| gate.strong_count() != 0);
++        let gate = if let Some(gate) = gates
++            .get(&(lane_id, channel_id))
++            .and_then(std::sync::Weak::upgrade)
++        {
++            gate
++        } else {
++            let gate = Arc::new(ChannelDeclarationGate::new());
++            gates.insert((lane_id, channel_id), Arc::downgrade(&gate));
++            gate
++        };
++        drop(gates);
++        DeclarationCapture::record(self, lane_id, &gate);
++        gate
+     }
+ 
+     /// Open the gates for `channels` (the channels a just-enqueued Call declared),
+     /// releasing any parked channel-item sends so they reach the wire AFTER the Call.
++    #[cfg(test)]
+     fn open_channel_gates(&self, lane_id: LaneId, channels: &[vox_types::ChannelId]) {
+         if channels.is_empty() {
+             return;
+@@ -3234,10 +3376,11 @@ impl ConnectionCore {
+             .lock()
+             .expect("channel gates mutex poisoned");
+         for id in channels {
+-            if let Some(gate) = gates.remove(&(lane_id, *id)) {
+-                gate.opened
+-                    .store(true, std::sync::atomic::Ordering::Release);
+-                gate.notify.notify_waiters();
++            if let Some(gate) = gates
++                .remove(&(lane_id, *id))
++                .and_then(|gate| gate.upgrade())
++            {
++                gate.finish(GateState::Open);
+             }
+         }
+     }
+@@ -3245,37 +3388,41 @@ impl ConnectionCore {
+     /// Wait until channel `channel_id`'s declaring Call has been enqueued (its gate is
+     /// open), if a gate exists. No gate (or an already-open one) returns immediately —
+     /// so a non-channel item, or an item whose Call already went out, never blocks.
+-    async fn await_channel_gate(&self, lane_id: LaneId, channel_id: vox_types::ChannelId) {
++    async fn await_channel_gate(
++        &self,
++        lane_id: LaneId,
++        channel_id: vox_types::ChannelId,
++    ) -> Result<(), ()> {
+         let gate = {
+             let gates = self
+                 .channel_gates
+                 .lock()
+                 .expect("channel gates mutex poisoned");
+             match gates.get(&(lane_id, channel_id)) {
+-                Some(gate) => Arc::clone(gate),
+-                None => return,
++                Some(gate) => match gate.upgrade() {
++                    Some(gate) => gate,
++                    None => return Ok(()),
++                },
++                None => return Ok(()),
+             }
+         };
+-        loop {
+-            if gate.opened.load(std::sync::atomic::Ordering::Acquire) {
+-                return;
+-            }
+-            let notified = gate.notify.notified();
+-            if gate.opened.load(std::sync::atomic::Ordering::Acquire) {
+-                return;
+-            }
+-            notified.await;
+-        }
++        gate.wait().await
+     }
+ 
+     /// Whether channel `channel_id` may send now: true if it has no gate (not a
+     /// locally-opened, not-yet-declared channel) or its gate is already open.
++    #[cfg(test)]
+     fn channel_gate_open(&self, lane_id: LaneId, channel_id: vox_types::ChannelId) -> bool {
++        self.channel_gate_state(lane_id, channel_id) == GateState::Open
++    }
++
++    fn channel_gate_state(&self, lane_id: LaneId, channel_id: vox_types::ChannelId) -> GateState {
+         self.channel_gates
+             .lock()
+             .expect("channel gates mutex poisoned")
+             .get(&(lane_id, channel_id))
+-            .is_none_or(|gate| gate.opened.load(std::sync::atomic::Ordering::Acquire))
++            .and_then(std::sync::Weak::upgrade)
++            .map_or(GateState::Open, |gate| gate.state())
+     }
+ 
+     fn prepare_outbound_batch<'a>(
+@@ -3287,6 +3434,7 @@ impl ConnectionCore {
+         extra_schema_sends: Vec<PendingSchemaSend>,
+     ) -> Result<PreparedOutboundBatch, PrepareOutboundError> {
+         let conn_id = msg.lane_id;
++        let capture = DeclarationCapture::begin(self, conn_id);
+         let mut incoming_response = None;
+         let outgoing_call = match &msg.payload {
+             MessagePayload::RequestMessage(RequestMessage {
+@@ -3325,6 +3473,7 @@ impl ConnectionCore {
+             let Some(tx) = inner.tx.clone() else {
+                 return Err(PrepareOutboundError {
+                     gated_channels: Vec::new(),
++                    gate_guard: capture.finish(),
+                 });
+             };
+             let conn_state = get_or_create_send_conn_state(&mut inner, conn_id);
+@@ -3425,7 +3574,10 @@ impl ConnectionCore {
+             let encoded = match encoded {
+                 Ok(encoded) => encoded,
+                 Err(_) => {
+-                    return Err(PrepareOutboundError { gated_channels });
++                    return Err(PrepareOutboundError {
++                        gated_channels,
++                        gate_guard: capture.finish(),
++                    });
+                 }
+             };
+             if let MessagePayload::RequestMessage(req) = &mut msg.payload
+@@ -3450,7 +3602,10 @@ impl ConnectionCore {
+         let payload_send = match prepared {
+             Ok(send) => send,
+             Err(_) => {
+-                return Err(PrepareOutboundError { gated_channels });
++                return Err(PrepareOutboundError {
++                    gated_channels,
++                    gate_guard: capture.finish(),
++                });
+             }
+         };
+         trace!(
+@@ -3476,6 +3631,7 @@ impl ConnectionCore {
+             },
+             result_rx,
+             gated_channels,
++            capture.finish(),
+         ))
+     }
+ 
+@@ -3512,10 +3668,10 @@ impl ConnectionCore {
+             futures_util::pin_mut!(gate, stopped);
+             futures_util::select_biased! {
+                 () = stopped => { declared_channels(&[]); return Err(()); },
+-                () = gate => {},
++                result = gate => { if result.is_err() { declared_channels(&[]); return Err(()); } },
+             }
+         }
+-        let (batch, result_rx, gated_channels) = match self.prepare_outbound_batch(
++        let (batch, result_rx, gated_channels, gate_guard) = match self.prepare_outbound_batch(
+             msg,
+             binder,
+             forwarded_schemas,
+@@ -3524,7 +3680,7 @@ impl ConnectionCore {
+         ) {
+             Ok(prepared) => prepared,
+             Err(err) => {
+-                self.open_channel_gates(lane_id, &err.gated_channels);
++                let _gate_guard = err.gate_guard;
+                 declared_channels(&err.gated_channels);
+                 return Err(());
+             }
+@@ -3558,16 +3714,14 @@ impl ConnectionCore {
+             Ok::<(), ()>(())
+         }
+         .await;
+-        // This Call is now on the queue (or the queue is gone): release its channels'
+-        // gates so parked items follow it — unconditionally, so a failed enqueue never
+-        // strands a parked `tx.send`.
+-        self.open_channel_gates(lane_id, &gated_channels);
+         if queued.is_err() {
+             if let Some(observer) = &self.observer {
+                 observer.driver_event(vox_types::DriverEvent::OutboundQueueClosed { lane_id });
+             }
+             return Err(());
+         }
++        // No cancellation point occurs between successful enqueue and opening.
++        gate_guard.open();
+         trace!(conn_id = %lane_id, "connection queued outbound batch");
+         let result = result_rx.await.map_err(|_| ());
+         trace!(
+@@ -3605,12 +3759,14 @@ impl ConnectionCore {
+         // r[impl rpc.channel.item] A channel item whose declaring Call hasn't been
+         // enqueued yet can't go out (frame order); signal backpressure so the caller
+         // retries — the async `send` path parks instead.
+-        if let Some(channel_id) = gated_channel_id(&msg)
+-            && !self.channel_gate_open(lane_id, channel_id)
+-        {
+-            return Err(TrySendError::Full(()));
++        if let Some(channel_id) = gated_channel_id(&msg) {
++            match self.channel_gate_state(lane_id, channel_id) {
++                GateState::Open => {}
++                GateState::Pending => return Err(TrySendError::Full(())),
++                GateState::Failed => return Err(TrySendError::Closed(())),
++            }
+         }
+-        let (batch, _result_rx, gated_channels) = match self.prepare_outbound_batch(
++        let (batch, _result_rx, _gated_channels, gate_guard) = match self.prepare_outbound_batch(
+             msg,
+             binder,
+             forwarded_schemas,
+@@ -3619,14 +3775,13 @@ impl ConnectionCore {
+         ) {
+             Ok(prepared) => prepared,
+             Err(err) => {
+-                self.open_channel_gates(lane_id, &err.gated_channels);
++                let _gate_guard = err.gate_guard;
+                 return Err(TrySendError::Closed(()));
+             }
+         };
+         let guard = match self.admission.try_lock() {
+             Ok(guard) => guard,
+             Err(_) => {
+-                self.open_channel_gates(lane_id, &gated_channels);
+                 return Err(if self.admission_is_stopped() {
+                     TrySendError::Closed(())
+                 } else {
+@@ -3636,7 +3791,6 @@ impl ConnectionCore {
+         };
+         if *guard || self.admission_is_stopped() {
+             drop(guard);
+-            self.open_channel_gates(lane_id, &gated_channels);
+             return Err(TrySendError::Closed(()));
+         }
+         // As above, a forced stop can overlap this already-admitted try-send.
+@@ -3659,8 +3813,9 @@ impl ConnectionCore {
+             }
+         });
+         drop(guard);
+-        // Release this Call's channel gates now that it's been handed to the queue.
+-        self.open_channel_gates(lane_id, &gated_channels);
++        if result.is_ok() {
++            gate_guard.open();
++        }
+         result
+     }
+ 
+@@ -3705,14 +3860,13 @@ impl ConnectionCore {
+     pub(crate) fn prepare_response_for_method(
+         &self,
+         conn_id: LaneId,
+-        request_id: RequestId,
++        _request_id: RequestId,
+         method_id: vox_types::MethodId,
+         response: &mut RequestResponse<'_>,
+     ) {
+         let mut inner = self.inner.lock().expect("connection core mutex poisoned");
+         let conn_state = get_or_create_send_conn_state(&mut inner, conn_id);
+-        let mut conn_state = conn_state.lock().expect("send conn state mutex poisoned");
+-        let key = (vox_types::BindingDirection::Response, method_id);
++        let conn_state = conn_state.lock().expect("send conn state mutex poisoned");
+         if conn_state
+             .send_tracker
+             .has_sent_binding(method_id, vox_types::BindingDirection::Response)
+@@ -3723,15 +3877,12 @@ impl ConnectionCore {
+ 
+         let prepared = match &response.ret {
+             vox_types::Payload::Value { shape, .. } => {
+-                match Self::get_or_plan_binding_for_shape(
+-                    &mut conn_state,
+-                    key,
+-                    request_id,
+-                    "response",
+-                    shape,
+-                ) {
+-                    Some(prepared) => prepared,
+-                    None => return,
++                match vox_types::SchemaSendTracker::plan_for_shape(shape) {
++                    Ok(prepared) => prepared,
++                    Err(error) => {
++                        tracing::error!("response schema extraction failed: {error}");
++                        return;
++                    }
+                 }
+             }
+             vox_types::Payload::Encoded(_) => {
+@@ -3746,8 +3897,8 @@ impl ConnectionCore {
+     }
+ 
+     /// Attach the method's response schema for an explicit wire `shape` (the
+-    /// erased-error-response path). Commits directly (best-effort dedup,
+-    /// `r[schema.exchange]`).
++    /// erased-error-response path). The outbound worker commits the schema only
++    /// after its ordered local send succeeds (`r[schema.exchange]`).
+     pub(crate) fn prepare_response_for_shape(
+         &self,
+         conn_id: LaneId,
+@@ -3758,7 +3909,7 @@ impl ConnectionCore {
+     ) {
+         let mut inner = self.inner.lock().expect("connection core mutex poisoned");
+         let conn_state = get_or_create_send_conn_state(&mut inner, conn_id);
+-        let mut conn_state = conn_state.lock().expect("send conn state mutex poisoned");
++        let conn_state = conn_state.lock().expect("send conn state mutex poisoned");
+         if conn_state
+             .send_tracker
+             .has_sent_binding(method_id, vox_types::BindingDirection::Response)
+@@ -3767,13 +3918,7 @@ impl ConnectionCore {
+             return;
+         }
+         match vox_types::SchemaSendTracker::plan_for_shape(shape) {
+-            Ok(prepared) => {
+-                response.schemas = conn_state.send_tracker.commit_prepared_plan(
+-                    method_id,
+-                    vox_types::BindingDirection::Response,
+-                    prepared,
+-                );
+-            }
++            Ok(prepared) => response.schemas = prepared.to_payload(),
+             Err(e) => tracing::error!("error-response schema extraction failed: {e}"),
+         }
+     }
+@@ -3826,7 +3971,7 @@ impl ConnectionCore {
+ 
+     fn plan_response_schema_send(
+         conn_state: &mut SendConnState,
+-        request_id: RequestId,
++        _request_id: RequestId,
+         method_id: vox_types::MethodId,
+         response: &mut RequestResponse<'_>,
+         forwarded_schemas: Option<&vox_types::SchemaRecvTracker>,
+@@ -3844,18 +3989,20 @@ impl ConnectionCore {
+         let prepared = if !response.schemas.is_empty() {
+             // The response already carries its phon schema closure (forwarded from
+             // upstream, or set by an earlier stage) — re-send it verbatim.
+-            conn_state
+-                .planned_bindings
+-                .get(&key)
+-                .cloned()
+-                .unwrap_or_else(|| vox_types::PreparedSchemaPlan {
+-                    bytes: response.schemas.0.clone(),
+-                })
++            vox_types::PreparedSchemaPlan {
++                bytes: response.schemas.0.clone(),
++            }
+         } else {
+             match &response.ret {
+-                vox_types::Payload::Value { shape, .. } => Self::get_or_plan_binding_for_shape(
+-                    conn_state, key, request_id, "response", shape,
+-                )?,
++                vox_types::Payload::Value { shape, .. } => {
++                    match vox_types::SchemaSendTracker::plan_for_shape(shape) {
++                        Ok(prepared) => prepared,
++                        Err(error) => {
++                            tracing::error!("response schema extraction failed: {error}");
++                            return None;
++                        }
++                    }
++                }
+                 vox_types::Payload::Encoded(_) => {
+                     let Some(source) = forwarded_schemas else {
+                         tracing::error!(
+@@ -3864,7 +4011,9 @@ impl ConnectionCore {
+                         );
+                         return None;
+                     };
+-                    Self::get_or_plan_binding_from_tracker(conn_state, key, source)?
++                    vox_types::PreparedSchemaPlan {
++                        bytes: source.writer_schema_bytes(key.1, key.0)?,
++                    }
+                 }
+             }
+         };
+@@ -4430,6 +4579,33 @@ mod tests {
+         assert_eq!(sent.lock().unwrap().len(), count_before);
+     }
+ 
++    #[tokio::test]
++    async fn encoder_panic_fails_only_its_own_captured_gates() {
++        let (connection, _lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
++        let core = connection.connection_core.clone();
++        let outer = DeclarationCapture::begin(&core, LaneId(1));
++        let outer_gate = core.register_channel_gate(LaneId(1), vox_types::ChannelId(3));
++        let other_lane_gate = core.register_channel_gate(LaneId(3), vox_types::ChannelId(3));
++        let inner_gate = Arc::new(Mutex::new(None));
++        let saved = inner_gate.clone();
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            let _inner = DeclarationCapture::begin(&core, LaneId(1));
++            let gate = core.register_channel_gate(LaneId(1), vox_types::ChannelId(5));
++            *saved.lock().unwrap() = Some(gate);
++            panic!("injected encoder panic after channel registration");
++        }));
++        assert!(result.is_err());
++        assert_eq!(
++            inner_gate.lock().unwrap().as_ref().unwrap().state(),
++            GateState::Failed
++        );
++        assert_eq!(outer_gate.state(), GateState::Pending);
++        outer.finish().open();
++        assert_eq!(outer_gate.state(), GateState::Open);
++        assert_eq!(other_lane_gate.state(), GateState::Pending);
++        connection.outbound_abort.abort();
++    }
++
+     #[tokio::test]
+     async fn channel_gates_for_equal_ids_on_distinct_lanes_are_independent() {
+         let (connection, _lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
+@@ -4438,17 +4614,21 @@ mod tests {
+         // Each lane's Driver has its own allocator, so both can allocate this ID.
+         let first_lane = LaneId(1);
+         let second_lane = LaneId(3);
+-        core.register_channel_gate(first_lane, channel_id);
+-        core.register_channel_gate(second_lane, channel_id);
++        let _first_gate = core.register_channel_gate(first_lane, channel_id);
++        let _second_gate = core.register_channel_gate(second_lane, channel_id);
+         let first_core = core.clone();
+         let first = tokio::spawn(async move {
+-            first_core.await_channel_gate(first_lane, channel_id).await;
++            first_core
++                .await_channel_gate(first_lane, channel_id)
++                .await
++                .unwrap();
+         });
+         let second_core = core.clone();
+         let mut second = tokio::spawn(async move {
+             second_core
+                 .await_channel_gate(second_lane, channel_id)
+-                .await;
++                .await
++                .unwrap();
+         });
+         core.open_channel_gates(first_lane, &[channel_id]);
+         tokio::time::timeout(Duration::from_secs(2), first)
+@@ -4479,7 +4659,7 @@ mod tests {
+         let (mut connection, lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
+         let sender = lane.sender.clone();
+         let channel_id = vox_types::ChannelId(3);
+-        connection
++        let _gate = connection
+             .connection_core
+             .register_channel_gate(sender.lane_id(), channel_id);
+         let message = ConnectionMessage::Channel(vox_types::ChannelMessage {
+@@ -4815,12 +4995,10 @@ mod tests {
+         call.abort();
+         let _cancelled = call.await.unwrap_err();
+         drop(held_admission);
+-        let first_stranded = tokio::time::timeout(Duration::from_millis(50), &mut first)
+-            .await
+-            .is_err();
+-        let second_stranded = tokio::time::timeout(Duration::from_millis(50), &mut second)
+-            .await
+-            .is_err();
++        let first_result = tokio::time::timeout(Duration::from_millis(50), &mut first).await;
++        let second_result = tokio::time::timeout(Duration::from_millis(50), &mut second).await;
++        let first_stranded = first_result.is_err();
++        let second_stranded = second_result.is_err();
+         let state = core
+             .inner
+             .lock()
+@@ -4835,17 +5013,23 @@ mod tests {
+             .inflight_outgoing
+             .contains_key(&RequestId(77));
+         core.force_stop_admission();
+-        let _first = tokio::time::timeout(Duration::from_secs(2), first)
+-            .await
+-            .unwrap();
+-        let _second = tokio::time::timeout(Duration::from_secs(2), second)
+-            .await
+-            .unwrap();
++        if first_stranded {
++            let _ = tokio::time::timeout(Duration::from_secs(2), first)
++                .await
++                .unwrap();
++        }
++        if second_stranded {
++            let _ = tokio::time::timeout(Duration::from_secs(2), second)
++                .await
++                .unwrap();
++        }
+         connection.outbound_abort.abort();
+         assert!(
+             !first_stranded && !second_stranded && !stale_request,
+             "cancelled call left waiters stranded: {first_stranded}/{second_stranded}, stale request: {stale_request}"
+         );
++        assert!(matches!(first_result, Ok(Ok(Err(())))));
++        assert!(matches!(second_result, Ok(Ok(Err(())))));
+     }
+ 
+     #[tokio::test]
+@@ -4855,7 +5039,7 @@ mod tests {
+         let request_id = RequestId(77);
+         let method_id = vox_types::MethodId(9);
+         let arg = 7u32;
+-        let (batch, result, gates) = core
++        let (batch, result, gates, gate_guard) = core
+             .prepare_outbound_batch(
+                 Message {
+                     lane_id: lane.sender.lane_id(),
+@@ -4883,6 +5067,7 @@ mod tests {
+             None
+         );
+         assert!(core.outbound_tx.send(batch).await.is_ok());
++        gate_guard.open();
+         result.await.unwrap().unwrap();
+         assert_eq!(
+             core.take_outgoing_call_method(lane.sender.lane_id(), request_id),
+@@ -4891,6 +5076,195 @@ mod tests {
+         connection.outbound_abort.abort();
+     }
+ 
++    #[tokio::test]
++    async fn failed_response_write_stops_later_queued_frames() {
++        struct ResponseFailTx {
++            observed: Arc<Mutex<Vec<&'static str>>>,
++            begun: Mutex<Option<oneshot::Sender<()>>>,
++            release: Mutex<Option<oneshot::Receiver<()>>>,
++        }
++        impl ConduitTx for ResponseFailTx {
++            type Error = std::io::Error;
++            type Msg = MessageFamily;
++            type Prepared = &'static str;
++            fn prepare_send(&self, item: Message<'_>) -> Result<Self::Prepared, Self::Error> {
++                Ok(match &item.payload {
++                    MessagePayload::SchemaMessage(_) => "schema",
++                    MessagePayload::RequestMessage(RequestMessage {
++                        body: RequestBody::Response(_),
++                        ..
++                    }) => "response",
++                    _ => "other",
++                })
++            }
++            async fn send_prepared(&self, item: Self::Prepared) -> Result<(), Self::Error> {
++                self.observed.lock().unwrap().push(item);
++                if item == "response" {
++                    let begun = self.begun.lock().unwrap().take();
++                    let release = self.release.lock().unwrap().take();
++                    if let Some(begun) = begun {
++                        let _ = begun.send(());
++                    }
++                    if let Some(release) = release {
++                        let _ = release.await;
++                    }
++                    return Err(std::io::Error::other("injected uncertain response write"));
++                }
++                Ok(())
++            }
++            async fn close(self) -> std::io::Result<()> {
++                Ok(())
++            }
++        }
++        fn channel() -> vox_types::ChannelMessage<'static> {
++            vox_types::ChannelMessage {
++                id: vox_types::ChannelId(99),
++                body: vox_types::ChannelBody::Close(vox_types::ChannelClose {
++                    metadata: Metadata::default(),
++                }),
++            }
++        }
++        let observed = Arc::new(Mutex::new(Vec::new()));
++        let (mut connection, lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
++        let sender = lane.sender.clone();
++        let core = connection.connection_core.clone();
++        let (begun_tx, begun_rx) = oneshot::channel("response_failure.begun");
++        let (release_tx, release_rx) = oneshot::channel("response_failure.release");
++        core.inner.lock().unwrap().tx = Some(Arc::new(ResponseFailTx {
++            observed: observed.clone(),
++            begun: Mutex::new(Some(begun_tx)),
++            release: Mutex::new(Some(release_rx)),
++        }));
++        let request_id = RequestId(77);
++        let method_id = vox_types::MethodId(9);
++        core.record_incoming_call(sender.lane_id(), request_id, method_id);
++        let response_sender = sender.clone();
++        let response = tokio::spawn(async move {
++            let ret: Result<u32, vox_types::VoxError<core::convert::Infallible>> = Ok(7);
++            response_sender
++                .send_response(
++                    request_id,
++                    RequestResponse {
++                        ret: vox_types::Payload::outgoing(&ret),
++                        metadata: Metadata::default(),
++                        schemas: Default::default(),
++                    },
++                )
++                .await
++        });
++        tokio::time::timeout(Duration::from_secs(2), begun_rx)
++            .await
++            .unwrap()
++            .unwrap();
++        sender
++            .try_send_channel_with_writer_schema(channel(), None)
++            .unwrap();
++        release_tx.send(()).unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_secs(2), response)
++                .await
++                .unwrap()
++                .unwrap()
++                .is_err()
++        );
++        tokio::time::timeout(Duration::from_secs(2), core.outbound_tx.closed())
++            .await
++            .unwrap();
++        assert!(matches!(
++            sender.try_send_channel_with_writer_schema(channel(), None),
++            Err(TrySendError::Closed(()))
++        ));
++        assert_eq!(*observed.lock().unwrap(), vec!["schema", "response"]);
++        tokio::time::timeout(Duration::from_secs(2), connection.run())
++            .await
++            .unwrap();
++        assert!(lane.close_reason().is_some());
++        assert!(core.inner.lock().unwrap().tx.is_none());
++    }
++
++    #[tokio::test]
++    async fn preparing_response_schema_does_not_mark_or_cache_it_as_sent() {
++        use facet::Facet;
++        let (connection, lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
++        let core = connection.connection_core.clone();
++        let lane_id = lane.sender.lane_id();
++        let method_id = vox_types::MethodId(301);
++        let error_method_id = vox_types::MethodId(303);
++        let request_id = RequestId(77);
++        let result: Result<u32, vox_types::VoxError<core::convert::Infallible>> = Ok(7);
++        let mut ordinary = RequestResponse {
++            ret: vox_types::Payload::outgoing(&result),
++            metadata: Metadata::default(),
++            schemas: Default::default(),
++        };
++        core.prepare_response_for_method(lane_id, request_id, method_id, &mut ordinary);
++        assert!(!ordinary.schemas.is_empty());
++        let mut error = RequestResponse {
++            ret: vox_types::Payload::outgoing(&result),
++            metadata: Metadata::default(),
++            schemas: Default::default(),
++        };
++        core.prepare_response_for_shape(
++            lane_id,
++            request_id,
++            error_method_id,
++            <Result<u32, vox_types::VoxError<core::convert::Infallible>> as Facet>::SHAPE,
++            &mut error,
++        );
++        assert!(!error.schemas.is_empty());
++        let state = core
++            .inner
++            .lock()
++            .unwrap()
++            .conns
++            .get(&lane_id)
++            .unwrap()
++            .clone();
++        {
++            let state = state.lock().unwrap();
++            assert!(
++                !state
++                    .send_tracker
++                    .has_sent_binding(method_id, vox_types::BindingDirection::Response)
++            );
++            assert!(
++                !state
++                    .send_tracker
++                    .has_sent_binding(error_method_id, vox_types::BindingDirection::Response)
++            );
++            assert!(
++                !state
++                    .planned_bindings
++                    .contains_key(&(vox_types::BindingDirection::Response, method_id))
++            );
++            assert!(
++                !state
++                    .planned_bindings
++                    .contains_key(&(vox_types::BindingDirection::Response, error_method_id))
++            );
++        }
++        core.record_incoming_call(lane_id, request_id, method_id);
++        lane.sender
++            .send_response(request_id, ordinary)
++            .await
++            .unwrap();
++        assert!(
++            state
++                .lock()
++                .unwrap()
++                .send_tracker
++                .has_sent_binding(method_id, vox_types::BindingDirection::Response)
++        );
++        assert!(
++            !state
++                .lock()
++                .unwrap()
++                .send_tracker
++                .has_sent_binding(error_method_id, vox_types::BindingDirection::Response)
++        );
++        connection.outbound_abort.abort();
++    }
++
+     #[tokio::test]
+     async fn prepared_response_keeps_binding_until_worker_accepts_it() {
+         let (connection, lane) = make_capturing_connection(Arc::new(Mutex::new(Vec::new())));
+@@ -4935,13 +5309,14 @@ mod tests {
+             state.lock().unwrap().inflight_incoming.get(&request_id),
+             Some(&method_id)
+         );
+-        let (batch, result, gates) = prepare();
++        let (batch, result, gates, gate_guard) = prepare();
+         assert!(gates.is_empty());
+         assert_eq!(
+             state.lock().unwrap().inflight_incoming.get(&request_id),
+             Some(&method_id)
+         );
+         assert!(core.outbound_tx.send(batch).await.is_ok());
++        gate_guard.open();
+         result.await.unwrap().unwrap();
+         assert!(
+             !state
+@@ -4992,7 +5367,7 @@ mod tests {
+             Some(Arc::new(RejectCallTx(CapturingTx { sent: sent.clone() })));
+         let driver = crate::Driver::new(lane, ());
+         let binder = driver.caller();
+-        let (_paired_tx, input) = vox_types::channel::<u32>();
++        let (paired_tx, input) = vox_types::channel::<u32>();
+         let args = Args { input };
+         let mut declared = Vec::new();
+         let result = sender
+@@ -5014,6 +5389,17 @@ mod tests {
+             .await;
+         assert!(result.is_err());
+         assert_eq!(declared.len(), 1);
++        assert!(
++            paired_tx.is_closed(),
++            "failed declaration must close its retained sender"
++        );
++        tokio::time::timeout(Duration::from_millis(200), paired_tx.closed())
++            .await
++            .unwrap();
++        assert!(matches!(
++            paired_tx.try_send(8),
++            Err(TrySendError::Closed(8))
++        ));
+         let channel = ConnectionMessage::Channel(vox_types::ChannelMessage {
+             id: declared[0],
+             body: vox_types::ChannelBody::Close(vox_types::ChannelClose {
+diff --git a/rust/vox-core/src/connection/response_reservation.rs b/rust/vox-core/src/connection/response_reservation.rs
+new file mode 100644
+index 00000000..07383523
+--- /dev/null
++++ b/rust/vox-core/src/connection/response_reservation.rs
+@@ -0,0 +1,273 @@
++//! Request identity and pre-admission reservation foundation.
++//!
++//! This module is not connected to the outbound path yet. In particular it
++//! does not implement queue commit, transport writes, or lane-close/write
++//! serialization. See `docs/design/response-reservation-2026-11-03.md`.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use vox_types::{MethodId, RequestId};
++
++/// One lane lifetime. Construct a fresh book for every new lane, even if a
++/// numeric lane ID is reused; old capabilities keep referring to the old book.
++#[derive(Clone, Default)]
++pub(super) struct RequestBook {
++    inner: Arc<Mutex<BookState>>,
++}
++
++#[derive(Default)]
++struct BookState {
++    closed: bool,
++    entries: HashMap<RequestId, RequestEntry>,
++}
++
++struct RequestEntry {
++    identity: Arc<()>,
++    method: MethodId,
++    reservation: Option<Arc<()>>,
++}
++
++/// Identity captured when an incoming request is admitted, not obtained by a
++/// later numeric-ID lookup. It must eventually travel through all reply paths.
++#[derive(Clone)]
++pub(super) struct RequestCapability {
++    book: Arc<Mutex<BookState>>,
++    id: RequestId,
++    identity: Arc<()>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum ReservationError {
++    Closed,
++    DuplicateRequest,
++    StaleRequest,
++    AlreadyReserved,
++}
++
++/// A reservation before queue admission. Dropping it releases only this exact
++/// reservation, and never revives a retired request or closed lane.
++pub(super) struct ResponseReservation {
++    request: RequestCapability,
++    identity: Arc<()>,
++}
++
++impl RequestBook {
++    pub(super) fn record(
++        &self,
++        id: RequestId,
++        method: MethodId,
++    ) -> Result<RequestCapability, ReservationError> {
++        let mut state = self.inner.lock().expect("request book mutex poisoned");
++        if state.closed {
++            return Err(ReservationError::Closed);
++        }
++        if state.entries.contains_key(&id) {
++            return Err(ReservationError::DuplicateRequest);
++        }
++        let identity = Arc::new(());
++        state.entries.insert(
++            id,
++            RequestEntry {
++                identity: Arc::clone(&identity),
++                method,
++                reservation: None,
++            },
++        );
++        Ok(RequestCapability {
++            book: Arc::clone(&self.inner),
++            id,
++            identity,
++        })
++    }
++
++    pub(super) fn reserve(
++        &self,
++        request: &RequestCapability,
++    ) -> Result<(MethodId, ResponseReservation), ReservationError> {
++        if !Arc::ptr_eq(&self.inner, &request.book) {
++            return Err(ReservationError::StaleRequest);
++        }
++        let mut state = self.inner.lock().expect("request book mutex poisoned");
++        if state.closed {
++            return Err(ReservationError::Closed);
++        }
++        let entry = state
++            .entries
++            .get_mut(&request.id)
++            .ok_or(ReservationError::StaleRequest)?;
++        if !Arc::ptr_eq(&entry.identity, &request.identity) {
++            return Err(ReservationError::StaleRequest);
++        }
++        if entry.reservation.is_some() {
++            return Err(ReservationError::AlreadyReserved);
++        }
++        let identity = Arc::new(());
++        entry.reservation = Some(Arc::clone(&identity));
++        Ok((
++            entry.method,
++            ResponseReservation {
++                request: request.clone(),
++                identity,
++            },
++        ))
++    }
++
++    /// Remove a request only after its lifecycle owner has established that no
++    /// reservation remains. Queued/writing/uncertain states are not yet modeled.
++    pub(super) fn retire_unreserved(
++        &self,
++        request: &RequestCapability,
++    ) -> Result<(), ReservationError> {
++        if !Arc::ptr_eq(&self.inner, &request.book) {
++            return Err(ReservationError::StaleRequest);
++        }
++        let mut state = self.inner.lock().expect("request book mutex poisoned");
++        if state.closed {
++            return Err(ReservationError::Closed);
++        }
++        let entry = state
++            .entries
++            .get(&request.id)
++            .ok_or(ReservationError::StaleRequest)?;
++        if !Arc::ptr_eq(&entry.identity, &request.identity) {
++            return Err(ReservationError::StaleRequest);
++        }
++        if entry.reservation.is_some() {
++            return Err(ReservationError::AlreadyReserved);
++        }
++        state.entries.remove(&request.id);
++        Ok(())
++    }
++
++    pub(super) fn close(&self) {
++        let mut state = self.inner.lock().expect("request book mutex poisoned");
++        state.closed = true;
++        state.entries.clear();
++    }
++}
++
++impl Drop for ResponseReservation {
++    fn drop(&mut self) {
++        // A poisoned book is not safe to reopen. Avoid a second panic during
++        // unwinding and leave the lane fail-closed for its owner to terminate.
++        let Ok(mut state) = self.request.book.lock() else {
++            return;
++        };
++        if state.closed {
++            return;
++        }
++        let Some(entry) = state.entries.get_mut(&self.request.id) else {
++            return;
++        };
++        if Arc::ptr_eq(&entry.identity, &self.request.identity)
++            && entry
++                .reservation
++                .as_ref()
++                .is_some_and(|marker| Arc::ptr_eq(marker, &self.identity))
++        {
++            entry.reservation = None;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Barrier;
++
++    #[test]
++    fn only_one_concurrent_reservation_wins_until_dropped() {
++        let book = RequestBook::default();
++        let request = book.record(RequestId(3), MethodId(7)).unwrap();
++        let start = Arc::new(Barrier::new(3));
++        let held = Arc::new(Barrier::new(3));
++        let mut threads = Vec::new();
++        for _ in 0..2 {
++            let (book, request, start, held) =
++                (book.clone(), request.clone(), start.clone(), held.clone());
++            threads.push(std::thread::spawn(move || {
++                start.wait();
++                let reservation = book.reserve(&request);
++                let won = reservation.is_ok();
++                held.wait();
++                drop(reservation);
++                won
++            }));
++        }
++        start.wait();
++        held.wait();
++        let winners = threads
++            .into_iter()
++            .map(|thread| thread.join().unwrap())
++            .filter(|won| *won)
++            .count();
++        assert_eq!(winners, 1);
++        assert!(book.reserve(&request).is_ok());
++    }
++
++    #[test]
++    fn numeric_id_reuse_does_not_revalidate_old_capabilities() {
++        let book = RequestBook::default();
++        let old = book.record(RequestId(3), MethodId(7)).unwrap();
++        assert!(matches!(
++            book.record(RequestId(3), MethodId(7)),
++            Err(ReservationError::DuplicateRequest)
++        ));
++        book.retire_unreserved(&old).unwrap();
++        let same_method = book.record(RequestId(3), MethodId(7)).unwrap();
++        assert!(matches!(
++            book.reserve(&old),
++            Err(ReservationError::StaleRequest)
++        ));
++        book.retire_unreserved(&same_method).unwrap();
++        let other_method = book.record(RequestId(3), MethodId(9)).unwrap();
++        assert!(matches!(
++            book.reserve(&same_method),
++            Err(ReservationError::StaleRequest)
++        ));
++        assert_eq!(book.reserve(&other_method).ok().unwrap().0, MethodId(9));
++    }
++
++    #[test]
++    fn abandoned_reservation_releases_only_its_own_live_request() {
++        let book = RequestBook::default();
++        let request = book.record(RequestId(3), MethodId(7)).unwrap();
++        let (_, held) = book.reserve(&request).ok().unwrap();
++        assert!(matches!(
++            book.retire_unreserved(&request),
++            Err(ReservationError::AlreadyReserved)
++        ));
++        assert!(matches!(
++            book.reserve(&request),
++            Err(ReservationError::AlreadyReserved)
++        ));
++        drop(held);
++        let (_, next) = book.reserve(&request).ok().unwrap();
++        drop(next);
++        book.retire_unreserved(&request).unwrap();
++        assert!(matches!(
++            book.reserve(&request),
++            Err(ReservationError::StaleRequest)
++        ));
++    }
++
++    #[test]
++    fn closing_a_lane_does_not_reopen_it_or_authorize_another_lane() {
++        let old_lane = RequestBook::default();
++        let old = old_lane.record(RequestId(3), MethodId(7)).unwrap();
++        let (_, held) = old_lane.reserve(&old).ok().unwrap();
++        old_lane.close();
++        drop(held);
++        assert!(matches!(
++            old_lane.reserve(&old),
++            Err(ReservationError::Closed)
++        ));
++        let replacement_lane = RequestBook::default();
++        let new = replacement_lane.record(RequestId(3), MethodId(7)).unwrap();
++        assert!(matches!(
++            replacement_lane.reserve(&old),
++            Err(ReservationError::StaleRequest)
++        ));
++        assert!(replacement_lane.reserve(&new).is_ok());
++    }
++}
+diff --git a/rust/vox-core/src/driver.rs b/rust/vox-core/src/driver.rs
+index a87baf9e..32b3edf1 100644
+--- a/rust/vox-core/src/driver.rs
++++ b/rust/vox-core/src/driver.rs
+@@ -31,6 +31,7 @@ use vox_types::{
+     LaneDebugSnapshot, LaneDebugState, RequestDebugSnapshot, RequestDebugState, VoxDebugSnapshot,
+ };
+ 
++use crate::connection::channel_gate_lifecycle::{ChannelDeclarationGate, GateState};
+ use crate::connection::{
+     ConnectionMessage, ConnectionSender, DropControlRequest, FailureDisposition, LaneHandle,
+ };
+@@ -1289,6 +1290,7 @@ pub struct DriverChannelSink {
+     local_control_tx: mpsc::UnboundedSender<DriverLocalControl>,
+     writer_schema: Option<vox_types::ChannelWriterSchemaPlan>,
+     close_signal: ChannelCloseSignal,
++    declaration_gate: Option<Arc<ChannelDeclarationGate>>,
+ }
+ 
+ impl ChannelSink for DriverChannelSink {
+@@ -1300,7 +1302,9 @@ impl ChannelSink for DriverChannelSink {
+         let shared = Arc::clone(&self.shared);
+         let channel_id = self.channel_id;
+         let writer_schema = self.writer_schema.clone();
++        let declaration_gate = self.declaration_gate.clone();
+         Box::pin(async move {
++            let _gate_lifetime = declaration_gate;
+             if shared.is_channel_terminal(channel_id) {
+                 return Err(TxError::Transport("channel closed".into()));
+             }
+@@ -1389,10 +1393,28 @@ impl ChannelSink for DriverChannelSink {
+ 
+     fn is_closed(&self) -> bool {
+         self.close_signal.is_closed()
++            || self
++                .declaration_gate
++                .as_ref()
++                .is_some_and(|gate| gate.state() == GateState::Failed)
+     }
+ 
+     fn closed(&self) -> Pin<Box<dyn vox_types::MaybeSendFuture<Output = ()> + '_>> {
+-        Box::pin(self.close_signal.closed())
++        Box::pin(async move {
++            if let Some(gate) = &self.declaration_gate {
++                let gate_failed = async {
++                    if gate.wait().await.is_ok() {
++                        std::future::pending::<()>().await;
++                    }
++                }
++                .fuse();
++                let closed = self.close_signal.closed().fuse();
++                futures_util::pin_mut!(gate_failed, closed);
++                futures_util::select_biased! { () = gate_failed => {}, () = closed => {} }
++            } else {
++                self.close_signal.closed().await;
++            }
++        })
+     }
+ 
+     fn close_channel(
+@@ -1406,7 +1428,9 @@ impl ChannelSink for DriverChannelSink {
+         let shared = Arc::clone(&self.shared);
+         let channel_id = self.channel_id;
+         let debug_context = self.debug_context;
++        let declaration_gate = self.declaration_gate.clone();
+         Box::pin(async move {
++            let _gate_lifetime = declaration_gate;
+             shared.mark_channel_terminal(channel_id);
+             shared.observe_channel(channel_id, debug_context, |channel| ChannelEvent::Closed {
+                 channel,
+@@ -1439,6 +1463,7 @@ impl ChannelSink for DriverChannelSink {
+             .local_control_tx
+             .send(DriverLocalControl::CloseChannel {
+                 channel_id: self.channel_id,
++                declaration_gate: self.declaration_gate.clone(),
+             });
+     }
+ }
+@@ -1724,6 +1749,7 @@ fn make_tx_channel_sink(
+     channel_id: ChannelId,
+     debug_context: Option<ChannelDebugContext>,
+     writer_schema: Option<vox_types::ChannelWriterSchemaPlan>,
++    declaration_gate: Option<Arc<ChannelDeclarationGate>>,
+ ) -> Arc<CreditSink<DriverChannelSink>> {
+     observe_channel_opened(
+         shared,
+@@ -1741,6 +1767,7 @@ fn make_tx_channel_sink(
+         local_control_tx: local_control_tx.clone(),
+         writer_schema,
+         close_signal,
++        declaration_gate,
+     };
+     let sink = Arc::new(CreditSink::new(inner, shared.peer_initial_channel_credit));
+     shared
+@@ -1762,16 +1789,20 @@ trait DriverChannelEndpoint {
+     ) -> (ChannelId, Arc<CreditSink<DriverChannelSink>>) {
+         let shared = self.endpoint_shared();
+         let channel_id = shared.channel_ids.lock().alloc();
+-        if gate_until_declaring_call {
++        let declaration_gate = if gate_until_declaring_call {
+             // r[impl rpc.channel.item] Register a CLOSED send-gate for this
+             // freshly-opened outbound channel BEFORE binding its sink, so an
+             // application `tx.send` that wakes when the sink binds parks until the
+             // declaring Call is enqueued — the Call must reach the wire before any
+             // item on the channel it opens.
+-            self.endpoint_sender()
+-                .connection_core
+-                .register_channel_gate(self.endpoint_sender().lane_id(), channel_id);
+-        }
++            Some(
++                self.endpoint_sender()
++                    .connection_core
++                    .register_channel_gate(self.endpoint_sender().lane_id(), channel_id),
++            )
++        } else {
++            None
++        };
+         let sink = make_tx_channel_sink(
+             self.endpoint_sender(),
+             shared,
+@@ -1779,6 +1810,7 @@ trait DriverChannelEndpoint {
+             channel_id,
+             debug_context,
+             None,
++            declaration_gate,
+         );
+         (channel_id, sink)
+     }
+@@ -1813,6 +1845,7 @@ trait DriverChannelEndpoint {
+             channel_id,
+             debug_context,
+             writer_schema,
++            None,
+         )
+     }
+ 
+@@ -2329,6 +2362,7 @@ pub struct Driver<H: Handler<DriverReplySink>> {
+ enum DriverLocalControl {
+     CloseChannel {
+         channel_id: ChannelId,
++        declaration_gate: Option<Arc<ChannelDeclarationGate>>,
+     },
+     ResetChannel {
+         channel_id: ChannelId,
+@@ -2841,7 +2875,11 @@ impl<H: Handler<DriverReplySink>> Driver<H> {
+ 
+     async fn handle_local_control(&mut self, control: DriverLocalControl) {
+         match control {
+-            DriverLocalControl::CloseChannel { channel_id } => {
++            DriverLocalControl::CloseChannel {
++                channel_id,
++                declaration_gate,
++            } => {
++                let _gate_lifetime = declaration_gate;
+                 self.close_outbound_channel(channel_id);
+                 self.shared
+                     .observe_channel(channel_id, None, |channel| ChannelEvent::Closed {
