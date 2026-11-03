@@ -516,6 +516,14 @@ pub fn verify_directory_acl(
     inspect_directory_acl(directory, user_sid, require_protected, false)
 }
 
+/// Check an already-open private key file without following a replacement.
+/// This checks the leaf only; the caller must separately secure its ancestry.
+pub(crate) fn verify_private_file_acl(file: &File) -> Result<()> {
+    ensure_not_impersonating()?;
+    regular_file_identity(file)?;
+    inspect_object_acl(file, &process_user_sid()?, true, false)
+}
+
 /// Inspect an alleged volume-root ACL for the proposed sibling-creation case.
 /// A successful result is only an ACL candidate: it does not verify that the
 /// handle is a volume root, establish ancestry, check effective tokens or

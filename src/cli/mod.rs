@@ -80,7 +80,7 @@ impl Cli {
 pub enum Command {
     /// Create, inspect, and validate move plans.
     Plan(PlanArgs),
-    /// Preview the disabled transfer command hierarchy.
+    /// Validate or send approved transfer inputs.
     Transfer(TransferArgs),
 }
 

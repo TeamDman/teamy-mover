@@ -97,6 +97,25 @@ fn receiver_limit_check_never_assigns_or_starts_a_process() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+#[cfg(windows)]
+#[test]
+fn receiver_command_rejects_incomplete_configuration_without_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("receive.json");
+    std::fs::write(&config, b"{}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+        .current_dir(dir.path())
+        .args(["transfer", "receive", "--validate-only", "--config-file"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid receiver configuration"));
+    assert_eq!(output.stdout, [0_u8; 0]);
+    assert_eq!(std::fs::read(&config).unwrap(), b"{}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
 #[test]
 fn validate_manifest_checks_local_approval_without_modifying_input() {
     let dir = tempfile::tempdir().unwrap();

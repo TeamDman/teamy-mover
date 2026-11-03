@@ -6,7 +6,7 @@ use arbitrary::Arbitrary;
 use facet::Facet;
 use figue as args;
 
-/// Validate transfer input. Sending and receiving remain disabled.
+/// Validate transfer inputs or use the direct sender.
 #[derive(Facet, Arbitrary, Debug, PartialEq)]
 pub struct TransferArgs {
     #[facet(args::subcommand)]
@@ -17,9 +17,9 @@ pub struct TransferArgs {
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum TransferCommand {
-    /// Validate Linux sources; operational sending is not yet available.
+    /// Verify or send locally approved Linux sources.
     Send(TransferSendArgs),
-    /// Receiving is not yet available.
+    /// Validate receiver configuration; live receiving remains gated.
     Receive(TransferReceiveArgs),
     /// Check a locally approved manifest without opening a connection.
     ValidateManifest(TransferValidateManifestArgs),
@@ -32,7 +32,7 @@ impl TransferArgs {
         match self.command {
             TransferCommand::ValidateManifest(args) => args.invoke(),
             TransferCommand::Send(args) => args.invoke().await,
-            TransferCommand::Receive(_) => Err(eyre::eyre!("transfer is not yet available")),
+            TransferCommand::Receive(args) => args.invoke(),
         }
     }
 }
