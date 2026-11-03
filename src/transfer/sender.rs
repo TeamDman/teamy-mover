@@ -314,6 +314,69 @@ pub async fn send_prepublication(
     .await?
 }
 
+/// Request connection shutdown even if the sending future is cancelled. Vox's
+/// shutdown request is asynchronous and does not itself prove transport teardown.
+struct ShutdownOnDrop(Option<BoundedConnection>);
+
+impl ShutdownOnDrop {
+    fn request_shutdown(&mut self) -> Result<()> {
+        if let Some(connection) = self.0.take() {
+            connection.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _requested = self.request_shutdown();
+    }
+}
+
+/// Send approved bodies through a caller-supplied approved CONNECT stream.
+///
+/// The caller must obtain the proxy stream, target and pinned TLS endpoint from
+/// local approval. This opens no socket, attempts no alternate route, does not
+/// publish, and never deletes sources. Success means the receiver reported all
+/// bodies checked, not that they were published or that shutdown settled.
+///
+/// # Errors
+/// Returns an error on CONNECT denial, authentication, source verification,
+/// timeout, Vox, receiver failure, or failure to request connection shutdown.
+pub async fn send_prepublication_via_proxy<S>(
+    proxy_stream: S,
+    target: &str,
+    tls: &super::tls::ClientEndpoint,
+    manifest_bytes: &[u8],
+    manifest_sha256: &str,
+    transaction_id: &str,
+    sources: Vec<Source>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::time::timeout(SESSION_DEADLINE, async {
+        let connection =
+            super::vox_transport::establish_client_via_proxy(proxy_stream, target, tls).await?;
+        let mut guard = ShutdownOnDrop(Some(connection));
+        let result = send_prepublication(
+            guard
+                .0
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("missing connection"))?,
+            manifest_bytes,
+            manifest_sha256,
+            transaction_id,
+            sources,
+        )
+        .await;
+        let shutdown = guard.request_shutdown();
+        result?;
+        shutdown
+    })
+    .await?
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

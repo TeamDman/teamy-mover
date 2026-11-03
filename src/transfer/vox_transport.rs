@@ -5,6 +5,7 @@
 
 use crate::transfer::tls::AuthenticatedClient;
 use crate::transfer::tls::AuthenticatedServer;
+use crate::transfer::tls::ClientEndpoint;
 use eyre::Result;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -96,6 +97,29 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     initiate(stream).await
+}
+
+/// Establish bounded Vox over an approved HTTP CONNECT tunnel and pinned mTLS.
+///
+/// The stream must already be connected to the locally approved proxy, and the
+/// target and TLS endpoint must come from the same local transaction approval.
+/// This function opens no socket and does not authorize a transfer, publication,
+/// or a fallback route. A CONNECT denial is returned before any TLS handshake.
+///
+/// # Errors
+/// Returns an error if CONNECT, TLS authentication or bounded Vox establishment
+/// fails or reaches its deadline.
+pub async fn establish_client_via_proxy<S>(
+    proxy_stream: S,
+    target: &str,
+    tls: &ClientEndpoint,
+) -> Result<BoundedConnection>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tunnel = crate::transfer::proxy::connect(proxy_stream, target).await?;
+    let authenticated = tls.connect(tunnel).await?;
+    establish_client(authenticated).await
 }
 
 /// Establish bounded Vox over a server stream returned by Mover's TLS checks.

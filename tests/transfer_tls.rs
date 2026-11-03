@@ -459,6 +459,21 @@ impl MemoryTransfer {
         let raw = format!(
             r#"{{"aggregate_bytes":10,"expires_unix":{expiry},"file_count":2,"files":[{{"id":"one","name":"a.bin","sha256":"{first}","size":5}},{{"id":"two","name":"b.bin","sha256":"{second}","size":5}}],"transaction_id":"{TRANSACTION_ID}","version":1}}"#
         );
+        Self::from_manifest(raw)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn three_with_expiry(expiry: u64) -> Self {
+        let first = format!("{:x}", Sha256::digest(b"hello"));
+        let second = format!("{:x}", Sha256::digest(b"world"));
+        let third = format!("{:x}", Sha256::digest(b"extra"));
+        let raw = format!(
+            r#"{{"aggregate_bytes":15,"expires_unix":{expiry},"file_count":3,"files":[{{"id":"one","name":"a.bin","sha256":"{first}","size":5}},{{"id":"two","name":"b.bin","sha256":"{second}","size":5}},{{"id":"three","name":"c.bin","sha256":"{third}","size":5}}],"transaction_id":"{TRANSACTION_ID}","version":1}}"#
+        );
+        Self::from_manifest(raw)
+    }
+
+    fn from_manifest(raw: String) -> Self {
         let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
         let manifest = parse_approved_manifest(raw.as_bytes(), &digest, TRANSACTION_ID, 1).unwrap();
         Self {
@@ -764,6 +779,116 @@ async fn production_sender_streams_files_over_pinned_tls_without_deleting_source
     })
     .await
     .expect("sender test timed out");
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn read_connect_request(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        assert!(request.len() < 8192, "CONNECT headers exceeded test limit");
+        request.push(stream.read_u8().await.unwrap());
+    }
+    request
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[tokio::test]
+async fn sender_streams_verified_sources_through_connect_and_pinned_tls() {
+    use teamy_mover::transfer::sender::send_prepublication_via_proxy;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let service = MemoryTransfer::three_with_expiry(now + 600);
+        let (client, server) = endpoints(
+            fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+            "100.64.0.1",
+            false,
+            false,
+        );
+        let (left, mut right) = tokio::io::duplex(128 * 1024);
+        let dispatcher = TransferWireDispatcher::new(service.clone());
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+        let proxy_and_server = async move {
+            let request = read_connect_request(&mut right).await;
+            assert!(request.starts_with(b"CONNECT 100.64.0.1:49152 HTTP/1.1\r\n"));
+            right
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let authenticated = server.accept(right).await.unwrap();
+            let _server_vox = vox_transport::establish_server(authenticated, dispatcher)
+                .await
+                .unwrap();
+            let _finished = finished_rx.await;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        let third = dir.path().join("c");
+        std::fs::write(&first, b"hello").unwrap();
+        std::fs::write(&second, b"world").unwrap();
+        std::fs::write(&third, b"extra").unwrap();
+        let sender = async {
+            let result = send_prepublication_via_proxy(
+                left,
+                "100.64.0.1:49152",
+                &client,
+                &service.manifest_bytes,
+                &service.manifest_digest,
+                TRANSACTION_ID,
+                vec![
+                    test_source("one", &first),
+                    test_source("two", &second),
+                    test_source("three", &third),
+                ],
+            )
+            .await;
+            let _sent = finished_tx.send(());
+            result
+        };
+        let (sent, ()) = tokio::join!(sender, proxy_and_server);
+        sent.unwrap();
+        assert_eq!(std::fs::read(first).unwrap(), b"hello");
+        assert_eq!(std::fs::read(second).unwrap(), b"world");
+        assert_eq!(std::fs::read(third).unwrap(), b"extra");
+        assert!(service.state.lock().await.bodies.all_bodies_checked(1));
+    })
+    .await
+    .expect("synthetic CONNECT transfer timed out");
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[tokio::test]
+async fn connect_denial_stops_before_tls_and_has_no_fallback() {
+    let (client, _server) = endpoints(
+        fixture(ExtendedKeyUsagePurpose::ClientAuth, false),
+        "100.64.0.1",
+        false,
+        false,
+    );
+    let (left, mut right) = tokio::io::duplex(16 * 1024);
+    let proxy = async move {
+        let request = read_connect_request(&mut right).await;
+        assert!(request.starts_with(b"CONNECT 100.64.0.1:49152 HTTP/1.1\r\n"));
+        right
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        let count = tokio::time::timeout(std::time::Duration::from_secs(2), right.read(&mut byte))
+            .await
+            .expect("client did not close denied tunnel")
+            .unwrap();
+        assert_eq!(count, 0, "TLS data was sent after CONNECT denial");
+    };
+    let (result, ()) = tokio::join!(
+        vox_transport::establish_client_via_proxy(left, "100.64.0.1:49152", &client),
+        proxy
+    );
+    assert!(result.unwrap_err().to_string().contains("HTTP 503"));
 }
 
 #[cfg(any(windows, target_os = "linux"))]
