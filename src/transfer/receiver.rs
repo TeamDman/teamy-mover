@@ -46,9 +46,12 @@ pub struct StagingPermit(());
 
 /// Reserved for a future reviewed replay gate that retains qualified final
 /// directory, file and transaction handles. No operational constructor exists.
-/// Before adding one, bind the permit to the live authenticated connection and
-/// revoke it on disconnect; the current authentication flag is not a liveness
-/// guarantee. A fresh authorization mechanism is also needed after expiry.
+/// Before adding one, review the asynchronous close-signal binding and retain
+/// qualified handles for its full lifetime. A fresh authorization mechanism is
+/// also needed after expiry. No signal proves instantaneous peer reachability.
+/// In a synthetic probe, graceful peer shutdown did not resolve `closed` within
+/// two seconds while the service lane stayed open; dropping the lane allowed it
+/// to resolve. This signal is not yet a sufficient live replay revocation gate.
 #[derive(Debug)]
 pub struct ReceiptReplayPermit {
     granted_at: std::time::Instant,
@@ -73,13 +76,15 @@ struct State {
     digest: String,
     files: BTreeMap<String, ExclusiveFile>,
     begun: bool,
-    authenticated: bool,
+    authenticated_connection: Option<BoundedConnection>,
     replay_permit: Option<ReceiptReplayPermit>,
     in_flight_or_failed: bool,
     deadline: tokio::time::Instant,
     io_gate: BlockingIoGate,
     #[cfg(test)]
     before_file_io: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    before_receipt_return: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// A one-connection receiver that cannot publish or delete files.
@@ -213,13 +218,15 @@ impl Receiver {
                 digest: approval.manifest_sha256.to_owned(),
                 files,
                 begun: false,
-                authenticated: false,
+                authenticated_connection: None,
                 replay_permit: None,
                 in_flight_or_failed: false,
                 deadline: tokio::time::Instant::now() + MAX_SESSION,
                 io_gate: gate,
                 #[cfg(test)]
                 before_file_io: None,
+                #[cfg(test)]
+                before_receipt_return: None,
             })),
             started: Arc::new(AtomicBool::new(false)),
         })
@@ -258,7 +265,7 @@ impl Receiver {
         let state = Arc::clone(&self.state);
         let connection =
             vox_transport::establish_server(stream, TransferWireDispatcher::new(self)).await?;
-        state.lock().await.authenticated = true;
+        state.lock().await.authenticated_connection = Some(connection.clone());
         Ok(connection)
     }
 }
@@ -346,7 +353,15 @@ impl TransferWire for Receiver {
             .try_lock()
             .map_err(|_error| TransferError::NotReady)?;
         check(&state, &transaction_id, &manifest_sha256)?;
-        if !state.authenticated || !state.begun || state.replay_permit.is_none() {
+        if !state.begun || state.replay_permit.is_none() {
+            return Err(TransferError::NotReady);
+        }
+        let connection = state
+            .authenticated_connection
+            .clone()
+            .ok_or(TransferError::NotReady)?;
+        if tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false }
+        {
             return Err(TransferError::NotReady);
         }
         if state.journal.is_none() {
@@ -367,13 +382,22 @@ impl TransferWire for Receiver {
         state.in_flight_or_failed = true;
         let gate = state.io_gate.clone();
         let worker_gate = gate.clone();
-        let result = gate
-            .run(budget, move || {
-                let bytes = journal.read_recorded_receipt_before(deadline, &worker_gate)?;
-                worker_gate.ensure_active()?;
-                Ok((journal, permit, bytes))
-            })
-            .await;
+        #[cfg(test)]
+        let before_receipt_return = state.before_receipt_return.take();
+        let work = gate.run(budget, move || {
+            let bytes = journal.read_recorded_receipt_before(deadline, &worker_gate)?;
+            #[cfg(test)]
+            if let Some(hook) = before_receipt_return {
+                hook();
+            }
+            worker_gate.ensure_active()?;
+            Ok((journal, permit, bytes))
+        });
+        let result = tokio::select! {
+            biased;
+            () = connection.closed() => return Err(TransferError::NotReady),
+            result = work => result,
+        };
         let (journal, permit, bytes) = result.map_err(|_error| TransferError::Failed)?;
         state.journal = Some(journal);
         state.replay_permit = Some(permit);
@@ -384,6 +408,10 @@ impl TransferWire for Receiver {
             .as_ref()
             .and_then(ReceiptReplayPermit::remaining)
             .ok_or(TransferError::Expired)?;
+        if tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false }
+        {
+            return Err(TransferError::NotReady);
+        }
         Ok(bytes)
     }
 
@@ -1117,9 +1145,9 @@ mod tests {
                         journal: Some(result.journal),
                         manifest: parse_approved_manifest(raw.as_bytes(), &digest, ID, now().unwrap()).unwrap(),
                         digest: digest.clone(), files: BTreeMap::new(), begun: false,
-                        authenticated: false, replay_permit: Some(synthetic_replay_permit()),
+                        authenticated_connection: None, replay_permit: Some(synthetic_replay_permit()),
                         in_flight_or_failed: false, deadline: tokio::time::Instant::now() + Duration::from_secs(10),
-                        io_gate: BlockingIoGate::default(), before_file_io: None,
+                        io_gate: BlockingIoGate::default(), before_file_io: None, before_receipt_return: None,
                     })),
                     started: Arc::new(AtomicBool::new(false)),
                 };
@@ -1132,7 +1160,7 @@ mod tests {
                     vox_transport::establish_client(client_tls.unwrap()), replay.establish(server_tls.unwrap())
                 );
                 let replay_client = client_conn.unwrap();
-                let _replay_server = server_conn.unwrap();
+                let replay_server = server_conn.unwrap();
                 let lane: crate::transfer::wire::TransferWireClient = replay_client.open_lane().await.unwrap();
                 lane.begin(1, ID.into(), digest.clone()).await.unwrap();
                 assert!(matches!(lane.receipt(ID.into(), "0".repeat(64)).await, Err(vox::VoxError::User(error)) if *error == TransferError::Rejected));
@@ -1149,11 +1177,42 @@ mod tests {
                 drop(replay_state);
                 assert!(matches!(lane.receipt(ID.into(), digest.clone()).await, Err(vox::VoxError::User(error)) if *error == TransferError::Expired));
                 let mut replay_state = replay_control.state.lock().await;
-                let replay_journal = replay_state.journal.take().unwrap();
+                replay_state.deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 drop(replay_state);
-                drop(replay_journal);
                 let journal_path = dir.path().join("private/journal.bin");
-                let reopened = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+                // The same receiver cannot be rebound to a second authenticated
+                // connection, even while the first one remains open.
+                let (left, right) = tokio::io::duplex(128 * 1024);
+                let (_new_client_tls, new_server_tls) = tokio::join!(client.connect(left), server.accept(right));
+                let error = replay_control.clone().establish(new_server_tls.unwrap()).await.unwrap_err();
+                assert!(error.to_string().contains("already started"));
+                // Disconnect after the receipt was read but before the worker
+                // can return it. The worker retains its journal until released.
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+                replay_control.state.lock().await.before_receipt_return = Some(Box::new(move || {
+                    let _sent = started.send(()); let _released = wait.recv();
+                }));
+                let request = replay_control.clone();
+                let request_digest = digest.clone();
+                let pending = tokio::spawn(async move { request.receipt(ID.into(), request_digest).await });
+                started_rx.await.unwrap();
+                replay_client.shutdown().unwrap();
+                let closed_with_lane_open = tokio::time::timeout(Duration::from_millis(250), replay_server.closed()).await;
+                drop(lane);
+                if closed_with_lane_open.is_err() {
+                    tokio::time::timeout(Duration::from_secs(2), replay_server.closed()).await.unwrap();
+                }
+                let result = tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap().unwrap();
+                assert!(matches!(result, Err(TransferError::NotReady)));
+                let _still_locked = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                release.send(()).unwrap();
+                let reopened = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Ok(lock) = ExclusiveFile::acquire(&journal_path, journal_id) { break lock; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("replay worker did not release its journal");
                 let mut recovered = TransactionJournal::reopen(reopened, &approval).unwrap();
                 assert_eq!(recovered.recorded_receipt(), Some(receipt.as_str()));
                 let published = open_checked_child(&parent, parent_id, "published", false).unwrap();
@@ -1180,11 +1239,45 @@ mod tests {
                     let path = dir.path().join("private/published").join(entry.name);
                     inspected_files.insert((*id).to_owned(), ExclusiveFile::acquire(&path, entry.identity).unwrap());
                 }
+                // Stall before inspection to model a worker whose OS call has
+                // not returned. This is not a real pending-kernel-I/O test.
+                let parent_after_stall = parent.try_clone().unwrap();
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+                let inspection_gate = BlockingIoGate::default();
+                let stalled_gate = inspection_gate.clone();
+                let stalled = tokio::spawn(async move {
+                    inspection.inspect_final_contents_with_stall(
+                        parent, inspected_files, stalled_gate, Duration::from_millis(250),
+                        Box::new(move || { let _sent = started.send(()); let _released = wait.recv(); }),
+                    ).await
+                });
+                started_rx.await.unwrap();
+                let _timeout = stalled.await.unwrap().unwrap_err();
+                let _locked_journal = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                let file_path = dir.path().join("private/published").join(entries[0].name);
+                let _locked_file = ExclusiveFile::acquire(&file_path, entries[0].identity).unwrap_err();
+                let _poisoned = inspection_gate.run(Duration::from_secs(1), || Ok(())).await.unwrap_err();
+                release.send(()).unwrap();
+                let lock = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Ok(lock) = ExclusiveFile::acquire(&journal_path, journal_id) { break lock; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("stalled inspection did not release its handles");
+                let inspection = LocalInspection::open(lock, &expired).unwrap();
+                let parent = parent_after_stall;
+                let mut inspected_files = BTreeMap::new();
+                for (id, entry) in ids.iter().zip(&entries) {
+                    let path = dir.path().join("private/published").join(entry.name);
+                    inspected_files.insert((*id).to_owned(), ExclusiveFile::acquire(&path, entry.identity).unwrap());
+                }
                 let snapshot = inspection.inspect_final_contents_bounded(
                     parent, inspected_files, BlockingIoGate::default(), Duration::from_secs(3),
                 ).await.unwrap();
                 let _held_journal = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
-                let (mut inspection, parent, mut inspected_files) = snapshot.into_parts();
+                let (mut inspection, parent, held_final, mut inspected_files) = snapshot.into_parts();
+                assert_eq!(directory_identity(&held_final).unwrap(), stage_id);
                 inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap();
                 let missing = inspected_files.remove("one").unwrap();
                 let _missing = inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap_err();
@@ -1203,6 +1296,7 @@ mod tests {
                 }
                 let _changed = inspection.inspect_final_contents(&parent, &mut changed_files).unwrap_err();
                 drop(changed_files);
+                drop(held_final);
                 let moved_path = dir.path().join("private/moved-original");
                 std::fs::rename(dir.path().join("private/published"), &moved_path).unwrap();
                 let replacement = dir.path().join("private/published");

@@ -25,6 +25,7 @@ const MAX_FRAME_BYTES: u32 = 64 * 1024;
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connection established with Mover's configured Vox ceilings.
+#[derive(Clone)]
 pub struct BoundedConnection(ConnectionHandle);
 
 impl fmt::Debug for BoundedConnection {

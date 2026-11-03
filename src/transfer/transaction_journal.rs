@@ -980,20 +980,26 @@ pub struct LocalInspection {
 }
 
 /// Owned result of a bounded read-only inspection. Holding this value retains
-/// the journal lock, parent and file handles, but does not qualify ancestry,
-/// retain the final-directory handle, or authorize replay or publication.
+/// the journal lock, parent, final-directory and file handles, but does not
+/// qualify ancestry, exclude pre-existing handles, or authorize replay or publication.
 #[derive(Debug)]
 pub struct InspectionSnapshot {
     inspection: LocalInspection,
     parent: File,
+    final_directory: File,
     files: BTreeMap<String, ExclusiveFile>,
 }
 
 impl InspectionSnapshot {
     /// Return the held resources for further local inspection.
     #[must_use]
-    pub fn into_parts(self) -> (LocalInspection, File, BTreeMap<String, ExclusiveFile>) {
-        (self.inspection, self.parent, self.files)
+    pub fn into_parts(self) -> (LocalInspection, File, File, BTreeMap<String, ExclusiveFile>) {
+        (
+            self.inspection,
+            self.parent,
+            self.final_directory,
+            self.files,
+        )
     }
 }
 
@@ -1124,6 +1130,7 @@ impl LocalInspection {
         files: &mut BTreeMap<String, ExclusiveFile>,
     ) -> Result<()> {
         self.inspect_final_contents_with(parent, files, &|| Ok(()))
+            .map(drop)
     }
 
     /// Inspect under a single-flight deadline while moving all supplied handles
@@ -1139,6 +1146,31 @@ impl LocalInspection {
         files: BTreeMap<String, ExclusiveFile>,
         gate: BlockingIoGate,
         budget: std::time::Duration,
+    ) -> Result<InspectionSnapshot> {
+        self.inspect_final_contents_bounded_inner(parent, files, gate, budget, None)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inspect_final_contents_with_stall(
+        self,
+        parent: File,
+        files: BTreeMap<String, ExclusiveFile>,
+        gate: BlockingIoGate,
+        budget: std::time::Duration,
+        hook: Box<dyn FnOnce() + Send>,
+    ) -> Result<InspectionSnapshot> {
+        self.inspect_final_contents_bounded_inner(parent, files, gate, budget, Some(hook))
+            .await
+    }
+
+    async fn inspect_final_contents_bounded_inner(
+        self,
+        parent: File,
+        files: BTreeMap<String, ExclusiveFile>,
+        gate: BlockingIoGate,
+        budget: std::time::Duration,
+        before_inspection: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<InspectionSnapshot> {
         ensure!(
             !budget.is_zero() && budget <= std::time::Duration::from_secs(30),
@@ -1159,11 +1191,18 @@ impl LocalInspection {
             };
             let mut inspection = self;
             let mut files = files;
-            inspection.inspect_final_contents_with(&parent, &mut files, &checkpoint)?;
+            checkpoint()?;
+            if let Some(hook) = before_inspection {
+                hook();
+            }
+            checkpoint()?;
+            let final_directory =
+                inspection.inspect_final_contents_with(&parent, &mut files, &checkpoint)?;
             checkpoint()?;
             Ok(InspectionSnapshot {
                 inspection,
                 parent,
+                final_directory,
                 files,
             })
         })
@@ -1175,7 +1214,7 @@ impl LocalInspection {
         parent: &File,
         files: &mut BTreeMap<String, ExclusiveFile>,
         checkpoint: &impl Fn() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<File> {
         use super::windows_acl::open_checked_child;
         use super::windows_lock::FileIdentity;
         use super::windows_stage::{ExpectedEntry, verify_entries};
@@ -1270,7 +1309,7 @@ impl LocalInspection {
             "journal changed while held"
         );
         checkpoint()?;
-        Ok(())
+        Ok(final_directory)
     }
 }
 
