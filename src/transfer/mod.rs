@@ -24,6 +24,8 @@ pub mod transaction_journal;
 pub mod verified_stream;
 pub mod vox_transport;
 #[cfg(windows)]
+pub mod windows_acl;
+#[cfg(windows)]
 pub mod windows_lock;
 #[cfg(windows)]
 pub mod windows_stage;
