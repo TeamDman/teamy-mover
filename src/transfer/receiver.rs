@@ -972,6 +972,7 @@ mod tests {
             RenameOutcome, rename_with_permit, synthetic_delayed_rename, synthetic_permit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         tokio::time::timeout(Duration::from_secs(15), Box::pin(async {
             let crash_root = std::env::var_os("TEAMY_TEST_CRASH_ROOT");
@@ -1024,15 +1025,35 @@ mod tests {
             let journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
             let receiver = Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap();
             let control = receiver.clone();
-            let (left, right) = tokio::io::duplex(128 * 1024);
-            let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
-            let (client_conn, server_conn) = tokio::join!(
-                vox_transport::establish_client(client_tls.unwrap()),
-                receiver.establish(server_tls.unwrap())
-            );
-            let client_conn = client_conn.unwrap();
-            let _server_conn = server_conn.unwrap();
-            send_prepublication(&client_conn, raw.as_bytes(), &digest, ID, sources).await.unwrap();
+            // A synthetic CONNECT tunnel exercises the actual bounded sender,
+            // mutual TLS, Vox driver and journal-backed receiver together.
+            // The fake stage permit and in-memory tunnel do not qualify a live
+            // destination or prove the cloud route is reachable.
+            let (left, mut right) = tokio::io::duplex(128 * 1024);
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+            let receiver_tls = server.clone();
+            let proxy_and_receiver = async move {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    request.push(right.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"CONNECT 100.64.0.1:49152 HTTP/1.1\r\n"));
+                right.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                let authenticated = receiver_tls.accept(right).await.unwrap();
+                let connection = receiver.establish(authenticated).await.unwrap();
+                let _finished = finished_rx.await;
+                connection
+            };
+            let sender = async {
+                let result = crate::transfer::sender::send_prepublication_via_proxy(
+                    left, "100.64.0.1:49152", &client, raw.as_bytes(), &digest, ID, sources,
+                ).await;
+                let _sent = finished_tx.send(());
+                result
+            };
+            let (sent, _server_conn) = tokio::join!(sender, proxy_and_receiver);
+            sent.unwrap();
             let mut receiver_state = control.state.lock().await;
             for (id, expected) in ids.iter().zip(bodies) {
                 assert!(receiver_state.journal.as_ref().unwrap().has_observation(id));
