@@ -157,22 +157,14 @@ deadlines against stalled and malicious peers, not only cooperative requests.
 
 The trusted desktop OS, administrator, approved operator and receiver process
 are in scope as authorities; arbitrary remote peers and other local users are
-untrusted. A malicious administrator or kernel is outside this guarantee. Other
-processes under the receiver's user account are not automatically trusted. The
-implementation must establish access controls and Windows share modes that
-prevent them from changing staged content, or require a dedicated isolated
-account/SID; if neither protection can be demonstrated, refuse to publish.
-
-### Proposed same-account publication boundary (review required)
-
-The operator has authorized trusting other processes running under their own
-Windows account not to interfere with the staging directory, provided that it
-is dedicated and outside ordinary working areas. This is a narrower local
-threat model than the preceding paragraph; it does not protect against a hostile
-process running as that same account. It does not relax protection against
-other users, remote peers, reparse points, unexpected stage contents, or an
-existing destination. The proposed implementation below requires independent
-review before it replaces the preceding fail-closed requirement.
+untrusted. A malicious administrator or kernel is outside this guarantee. The
+operator has authorized trusting other processes running under their own Windows
+account not to interfere with the staging directory, provided that it is
+dedicated and outside ordinary working areas. This threat model does not protect
+against a hostile process running as that same account. Other-user write and
+delete access to the stage and trusted ancestry must remain excluded through
+verification and publication. The amendment requires independent review before
+executor implementation.
 
 Use a private application staging root, outside normal working directories,
 on the same volume as the destination; fail closed if that location cannot be
@@ -188,12 +180,14 @@ each approved file, and confirm the journal binding and absent final name.
 NTFS may refuse to rename a directory while children are open. If so, after
 verification the receiver may close its child handles just before the rename,
 relying on the stated same-account non-interference assumption for that window.
-Use a same-volume handle-relative Windows no-replace rename to the retained,
-verified destination-parent handle. Test collisions, handle sharing, reparse
-and hard-link rejection, identity checks, and cancellation or process failure at
-every transition using synthetic files. An ambiguous rename or interrupted
-journal update must preserve the objects for inspection and must not produce a
-success receipt or delete a source. No claim of crash durability follows from a
+Retain the transaction lock, stage directory handle and verified destination-
+parent handle across verification and publication. Use an atomic, same-volume,
+handle-relative Windows no-replace rename to the retained destination-parent
+handle on a filesystem qualified by the required tests. Test collisions, handle
+sharing, reparse and hard-link rejection, identity checks, and cancellation or
+process failure at every transition using synthetic files. An ambiguous rename
+or interrupted journal update must preserve the objects for inspection and not
+produce a success receipt or delete a source. No claim of crash durability follows from a
 successful rename; report the explicitly unconfirmed outcome unless the
 required filesystem guarantees are independently established.
 
@@ -221,15 +215,16 @@ flushed same-directory replacement or an equivalently tested atomic journal.
 Do not store private keys in it. Cross-process locking, protected configuration
 and journal identity are requirements, not guarantees derived from a filename.
 
-Keep staging inaccessible to untrusted writers through verification and
-publication. Create files exclusively with no-follow semantics and sharing
-modes that exclude concurrent writes/deletes; retain the relevant handles,
-recheck identities and hashes, and verify the stage contains exactly the
-approved file set. Immediately before publication revalidate stage and
-destination-parent identities, reparse status, lock ownership and final-name
-absence. Windows handle sharing needed for a directory rename must be tested;
-if these protections conflict with the no-replace rename, fail closed instead
-of dropping the protections.
+Keep staging inaccessible to untrusted other-user writers through verification
+and publication, including after closing child handles. Create files exclusively
+with no-follow semantics and sharing modes that exclude concurrent writes and
+deletes while held; recheck identities and hashes and verify the stage contains
+exactly the approved file set. Immediately before publication revalidate stage
+and destination-parent identities, reparse status, lock ownership and final-name
+absence. Child handles may be released only as described in the same-account
+boundary above; retain the stage directory, destination-parent and lock handles.
+Fail closed if the remaining protections or atomic no-replace rename cannot be
+established on the qualified filesystem.
 
 ## Wire protocol and receiver state
 
@@ -255,7 +250,9 @@ transition is persisted before an operation that depends on it; partial files
 and file completion are also recorded and identity-bound. All files are created
 exclusively in the same-filesystem stage, streamed, flushed through the file
 handles, rehashed and checked before `verified`. Flush and persist the verified
-manifest, identities and `commit-intent` before attempting publication.
+manifest, identities and `commit-intent` before attempting publication. The
+commit-intent must include the pre-rename stage volume and file ID, bound to the
+approved manifest and destination-parent identity.
 
 Publication is the point of no return: atomically rename the complete stage to
 the absent final name using a tested platform-specific **no-replace** operation;
@@ -269,22 +266,30 @@ receipt and `receipt-recorded`; flush file, journal and directory metadata in
 the tested order. Do not assume a directory metadata flush is supported or
 durable on Windows merely because a call succeeds.
 
-If atomic no-replace cannot be demonstrated, fail before publication. If
-publication succeeds but directory/journal durability is not confirmed, report
-`published-durability-unconfirmed`, preserve the final directory and journal,
-and require local verification/reconciliation; never report durable commit.
+If atomic no-replace cannot be demonstrated, fail before publication. If the
+rename is definitely known to have succeeded but directory/journal durability
+is not confirmed, report `published-durability-unconfirmed`, preserve the final
+directory and journal, and require local verification/reconciliation; never
+report durable commit. An ambiguous rename outcome is not known success: preserve
+the stage, final object and journal as found and issue no success receipt until
+local identity and content reconciliation establishes what happened.
 Cancellation before publication reports unpublished and preserves or safely
 removes only identity-checked stage data. Cancellation or failure after the
 rename must report published or publication-uncertain, never "nothing
 published"; it must not delete the destination. A crash between rename and
-journal update is ambiguous until recovery matches the published directory's
-identity and rehashes every approved file.
+journal update is ambiguous until recovery compares the final directory's volume
+and file ID with the pre-rename stage identity in persisted commit-intent, and
+revalidates the exact approved set, regular-file identities, link counts,
+reparse restrictions and every file hash. A mismatch or inconclusive check must
+remain ambiguous and must not produce a success receipt.
 
 A receipt is deterministic canonical data containing protocol version,
 transaction ID, approved manifest digest, outcome, and verified ordered file
 IDs, sizes and hashes; it has no variable timestamp. Only call its outcome
 `durable` after the required filesystem ordering is established and the receipt
-is persisted. Otherwise use `published-durability-unconfirmed`. Return the
+is persisted. For definitely successful or successfully reconciled publication
+without proven crash durability, use `published-durability-unconfirmed`; an
+ambiguous outcome gets no success receipt. Return the
 persisted same bytes only on the authenticated channel. This is evidence of the
 receiver's observed state, not proof of a backup or permission to delete a
 source.
@@ -309,8 +314,10 @@ After the window it closes the listener and removes its ephemeral credentials.
 There is no unauthenticated status endpoint. If the process or machine crashes,
 the receiver does not automatically reopen network access. A local recovery
 command inspects the persisted transaction record and staging/final directory,
-then either binds the published directory identity to the journal and rehashes
-the complete approved file set to reconstruct the same deterministic receipt,
+then either matches the final volume and file ID against the pre-rename stage
+identity in commit-intent and rechecks the exact approved set, regular-file
+identities, link counts, reparse restrictions and hashes to reconstruct the
+same deterministic receipt,
 or reports an incomplete/ambiguous commit for an authorized operator. It must
 retain an unconfirmed-durability outcome where crash durability was not proven.
 Recovery must never overwrite an existing destination or infer success solely
