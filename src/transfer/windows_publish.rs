@@ -233,6 +233,14 @@ struct RetainedDestination {
     ancestry: Vec<File>,
 }
 
+// A directory identity and pre-rename checks do not establish that every
+// reopened final file still has its approved identity, hash and stream set.
+// Keep the receipt path closed until the handle-relative, deadline-bound final
+// re-verification implementation and its independent review are complete.
+fn require_post_rename_file_verification() -> Result<()> {
+    eyre::bail!("post-rename file re-verification is not available")
+}
+
 async fn run_owned<F>(
     permit: PublicationPermit,
     mut journal: TransactionJournal,
@@ -285,11 +293,22 @@ where
             // a success or receipt through a poisoned gate.
             worker_gate.ensure_active()?;
             if outcome == RenameOutcome::RenamedDurabilityUnconfirmed {
-                let recorded =
-                    observed_publication(&journal, &stage, &destination.parent, &final_name)
-                        .and_then(|evidence| {
-                            journal.record_observed_publication(evidence, &worker_gate)
-                        });
+                let recorded = (|| {
+                    let parent_id = directory_identity(&destination.parent)?;
+                    let stage_id = directory_identity(&stage)?;
+                    super::windows_streams::verify_directory_streams(&destination.parent, parent_id)?;
+                    worker_gate.ensure_active()?;
+                    super::windows_streams::verify_directory_streams(&stage, stage_id)?;
+                    worker_gate.ensure_active()?;
+                    let evidence = observed_publication(
+                        &journal,
+                        &stage,
+                        &destination.parent,
+                        &final_name,
+                    )?;
+                    require_post_rename_file_verification()?;
+                    journal.record_observed_publication(evidence, &worker_gate)
+                })();
                 if recorded.is_err() {
                     journal.mark_publication_uncertain();
                     outcome = RenameOutcome::RenamedRecordUnconfirmed;
@@ -383,16 +402,18 @@ pub async fn commit_qualified_stage(
     input: QualifiedCommit,
     budget: Duration,
 ) -> Result<RenameResult> {
-    commit_qualified_stage_inner(input, budget, || {}).await
+    commit_qualified_stage_inner(input, budget, || {}, || {}).await
 }
 
-async fn commit_qualified_stage_inner<F>(
+async fn commit_qualified_stage_inner<F, G>(
     mut input: QualifiedCommit,
     budget: Duration,
     after_intent: F,
+    after_files_closed: G,
 ) -> Result<RenameResult>
 where
     F: FnOnce() + Send + 'static,
+    G: FnOnce() + Send + 'static,
 {
     ensure!(
         !budget.is_zero() && budget <= Duration::from_secs(30),
@@ -416,6 +437,9 @@ where
     let prepared = gate
         .run(budget, move || {
             worker_gate.ensure_active()?;
+            let parent_id = directory_identity(&input.destination_parent)?;
+            super::windows_streams::verify_directory_streams(&input.destination_parent, parent_id)?;
+            worker_gate.ensure_active()?;
             input.journal.check_pre_intent_target(
                 &input.destination_parent,
                 &input.stage,
@@ -434,6 +458,7 @@ where
             // The qualification gate must establish the approved same-account trust
             // boundary and exclude other-user mutation during this interval.
             drop(std::mem::take(&mut input.files));
+            after_files_closed();
             worker_gate.ensure_active()?;
             ensure!(
                 std::time::Instant::now() < deadline,
@@ -467,7 +492,19 @@ pub(crate) async fn synthetic_commit_with_hook<F>(
 where
     F: FnOnce() + Send + 'static,
 {
-    commit_qualified_stage_inner(input, budget, after_intent).await
+    commit_qualified_stage_inner(input, budget, after_intent, || {}).await
+}
+
+#[cfg(test)]
+pub(crate) async fn synthetic_commit_after_close_hook<F>(
+    input: QualifiedCommit,
+    budget: Duration,
+    after_files_closed: F,
+) -> Result<RenameResult>
+where
+    F: FnOnce() + Send + 'static,
+{
+    commit_qualified_stage_inner(input, budget, || {}, after_files_closed).await
 }
 
 #[cfg(test)]

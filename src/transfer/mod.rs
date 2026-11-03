@@ -35,4 +35,6 @@ pub mod windows_process_limit;
 pub mod windows_publish;
 #[cfg(windows)]
 pub mod windows_stage;
+#[cfg(windows)]
+pub mod windows_streams;
 pub mod wire;

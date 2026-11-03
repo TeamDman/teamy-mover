@@ -882,6 +882,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual NTFS named-stream injection probe; synthetic permit only"]
+    async fn stream_added_after_intent_does_not_get_a_receipt() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::NamedStream).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS post-close stream injection probe; receipt gate remains closed"]
+    async fn file_stream_added_after_close_does_not_get_a_receipt() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileStreamAfterClose).await;
+    }
+
+    #[tokio::test]
     #[ignore = "manual NTFS timeout probe; synthetic permit only"]
     async fn coordinated_commit_timeout_after_intent_preserves_stage() {
         protected_three_file_simulation_inner(true, false, None, false, CommitMode::Timeout).await;
@@ -1101,6 +1113,8 @@ mod tests {
         Timeout,
         Cancel,
         WrongTarget,
+        NamedStream,
+        FileStreamAfterClose,
         Rpc,
         RpcCollision,
         RpcProduction,
@@ -1142,7 +1156,7 @@ mod tests {
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            rename_with_permit_and_ancestry, synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
+            rename_with_permit_and_ancestry, synthetic_commit_after_close_hook, synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
             synthetic_publication_qualification, synthetic_qualified_commit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
@@ -1423,6 +1437,35 @@ mod tests {
                     assert!(!dir.path().join("private/wrong").exists());
                     assert!(!dir.path().join("private/published").exists());
                     assert!(dir.path().join("private/stage").is_dir());
+                    return;
+                }
+                if mode == CommitMode::NamedStream {
+                    let mut stream_name = dir.path().join("private/stage").into_os_string();
+                    stream_name.push(":unexpected");
+                    let hook = move || std::fs::write(std::path::PathBuf::from(stream_name), b"hidden").unwrap();
+                    let result = synthetic_commit_with_hook(input, Duration::from_secs(3), hook)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.outcome, RenameOutcome::RenamedRecordUnconfirmed);
+                    assert!(result.journal.recorded_receipt().is_none());
+                    assert!(dir.path().join("private/published").is_dir());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
+                    return;
+                }
+                if mode == CommitMode::FileStreamAfterClose {
+                    let mut stream_name = dir.path().join("private/stage/one.bin").into_os_string();
+                    stream_name.push(":unexpected");
+                    let hook = move || std::fs::write(std::path::PathBuf::from(stream_name), b"hidden").unwrap();
+                    let result = synthetic_commit_after_close_hook(input, Duration::from_secs(3), hook)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.outcome, RenameOutcome::RenamedRecordUnconfirmed);
+                    assert!(result.journal.recorded_receipt().is_none());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
                     return;
                 }
                 if matches!(mode, CommitMode::Timeout | CommitMode::Cancel) {

@@ -95,6 +95,44 @@ impl Fixture {
     }
 }
 
+fn named_stream(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(":unexpected");
+    PathBuf::from(name)
+}
+
+#[test]
+fn unexpected_stream_prevents_file_observation() {
+    let fixture = Fixture::new();
+    std::fs::write(named_stream(&fixture.body), b"hidden").unwrap();
+    let mut journal =
+        TransactionJournal::initialize(fixture.lock(), &fixture.approval(PIN, 1)).unwrap();
+    let _rejected = journal.verify_file("one", &mut fixture.body(), 1).unwrap_err();
+    assert!(!journal.has_observation("one"));
+    assert_eq!(std::fs::read(&fixture.body).unwrap(), b"hello");
+}
+
+#[test]
+fn local_recovery_rejects_stream_added_after_commit_intent() {
+    let fixture = Fixture::new();
+    let mut journal =
+        TransactionJournal::initialize(fixture.lock(), &fixture.approval(PIN, 1)).unwrap();
+    journal.verify_file("one", &mut fixture.body(), 1).unwrap();
+    journal.record_commit_intent(2).unwrap();
+    drop(journal);
+    std::fs::write(named_stream(&fixture.body), b"hidden").unwrap();
+    let body_id = regular_file_identity(&File::open(&fixture.body).unwrap()).unwrap();
+    let mut held = ExclusiveFile::acquire(&fixture.body, body_id).unwrap();
+    let mut inspection = LocalInspection::open(fixture.lock(), &fixture.approval(PIN, 101)).unwrap();
+    assert_eq!(
+        inspection.disposition(),
+        RecoveryDisposition::InspectAmbiguousPublication
+    );
+    let _rejected = inspection.verify_recorded_file("one", &mut held).unwrap_err();
+    drop(held);
+    assert_eq!(std::fs::read(&fixture.body).unwrap(), b"hello");
+}
+
 #[test]
 fn real_file_observation_survives_reopen_and_requires_reverification() {
     let fixture = Fixture::new();

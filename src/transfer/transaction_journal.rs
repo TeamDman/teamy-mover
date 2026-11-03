@@ -709,6 +709,13 @@ impl TransactionJournal {
                 "conflicting file identity"
             );
         }
+        let stream_identity = super::windows_lock::FileIdentity {
+            volume_serial: object.volume_serial,
+            file_index: object.file_index,
+        };
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
+        super::windows_streams::verify_file_streams(file, stream_identity, approved.size())?;
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         file.seek(SeekFrom::Start(0))?;
         let mut verifier = FileVerifier::new(approved, std::io::sink());
         let mut buf = [0u8; 16 * 1024];
@@ -725,6 +732,8 @@ impl TransactionJournal {
         }
         verifier.finish()?;
         file.sync_all()?;
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
+        super::windows_streams::verify_file_streams(file, stream_identity, approved.size())?;
         ensure!(identity(file)? == object, "file identity changed");
         ensure!(
             clock()? < self.manifest.expires_unix(),
@@ -818,6 +827,9 @@ impl TransactionJournal {
                 },
             "stage identity mismatch"
         );
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(stage, stage_id)?;
+        checkpoint()?;
         ensure!(
             files.len() == self.manifest.files().len(),
             "file set mismatch"
@@ -851,6 +863,8 @@ impl TransactionJournal {
             file.verify()?;
         }
         verify_entries(stage, stage_id, &entries)?;
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(stage, stage_id)?;
         let current = checkpoint()?;
         self.record_commit_intent(current)?;
         checkpoint()?;
@@ -1213,6 +1227,10 @@ impl LocalInspection {
             identity(file.file_mut())? == expected_identity,
             "file identity mismatch"
         );
+        let file_identity = file.identity();
+        checkpoint()?;
+        super::windows_streams::verify_file_streams(file.file_mut(), file_identity, approved.size())?;
+        checkpoint()?;
         file.file_mut().seek(SeekFrom::Start(0))?;
         let mut verifier = FileVerifier::new(approved, std::io::sink());
         let mut buffer = [0_u8; 16 * 1024];
@@ -1226,6 +1244,8 @@ impl LocalInspection {
             verifier.push(&buffer[..count])?;
         }
         verifier.finish()?;
+        checkpoint()?;
+        super::windows_streams::verify_file_streams(file.file_mut(), file_identity, approved.size())?;
         checkpoint()?;
         file.verify()?;
         ensure!(
@@ -1333,6 +1353,10 @@ impl LocalInspection {
         .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep final identity, stream and file checks in their checkpoint order"
+    )]
     fn inspect_final_contents_with(
         &mut self,
         parent: &File,
@@ -1364,6 +1388,8 @@ impl LocalInspection {
                 && actual_parent.file_index == expected_parent.file_index,
             "parent identity mismatch"
         );
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(parent, actual_parent)?;
         let final_name = self.journal.binding.final_component().to_owned();
         checkpoint()?;
         let final_directory = open_checked_child(parent, actual_parent, &final_name, false)?;
@@ -1409,6 +1435,8 @@ impl LocalInspection {
         checkpoint()?;
         verify_entries(&final_directory, stage_id, &entries)?;
         checkpoint()?;
+        super::windows_streams::verify_directory_streams(&final_directory, stage_id)?;
+        checkpoint()?;
         for item in &expected {
             let file = files
                 .get_mut(&item.id)
@@ -1417,6 +1445,10 @@ impl LocalInspection {
         }
         checkpoint()?;
         verify_entries(&final_directory, stage_id, &entries)?;
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(&final_directory, stage_id)?;
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(parent, actual_parent)?;
         checkpoint()?;
         let reopened = open_checked_child(parent, actual_parent, &final_name, false)?;
         checkpoint()?;
