@@ -43,6 +43,9 @@ use windows::Win32::System::Threading::{
 // all write, delete, owner or DACL-changing rights fail closed. Directory
 // rights use the same low bits as file rights; 0x20 is traverse/execute.
 const UNTRUSTED_READ_ONLY: u32 = 0x8000_0000 | 0x2000_0000 | 0x0010_0000 | 0x0002_0000 | 0xA9;
+const ADD_SUBDIRECTORY: u32 = 0x0000_0004;
+// Inheritable create rights could also apply to protected descendants.
+const ACE_INHERITANCE_FLAGS: u8 = 0x01 | 0x02 | 0x08;
 const MAX_ACES: usize = 512;
 
 struct LocalDescriptor(PSECURITY_DESCRIPTOR);
@@ -67,7 +70,13 @@ impl PrivateDirectorySecurity {
     pub fn verify_for_process(&self) -> Result<()> {
         let sid = process_user_sid()?;
         let mut words = sid_storage(&sid)?;
-        verify_descriptor_inner(self.0.0, PSID(words.as_mut_ptr().cast()), true, false)
+        verify_descriptor_inner(
+            self.0.0,
+            PSID(words.as_mut_ptr().cast()),
+            true,
+            false,
+            false,
+        )
     }
 }
 
@@ -225,7 +234,7 @@ pub fn private_directory_security() -> Result<PrivateDirectorySecurity> {
     );
     // A new object receives its default owner during creation, so the owner
     // must also be checked on the created object's handle before relying on it.
-    verify_descriptor_inner(owned.0, user, true, false)?;
+    verify_descriptor_inner(owned.0, user, true, false, false)?;
     Ok(PrivateDirectorySecurity(owned))
 }
 
@@ -244,7 +253,13 @@ fn is_trusted_sid(sid: PSID, user: PSID) -> bool {
     same_user || system || admins
 }
 
-fn verify_ace(acl: *mut ACL, index: u32, user: PSID, acl_size: usize) -> Result<()> {
+fn verify_ace(
+    acl: *mut ACL,
+    index: u32,
+    user: PSID,
+    acl_size: usize,
+    root_sibling_create_candidate: bool,
+) -> Result<()> {
     let mut ace_ptr = std::ptr::null_mut();
     // SAFETY: the ACL was validated and ace_ptr is a writable out pointer.
     unsafe { GetAce(acl, index, &raw mut ace_ptr)? };
@@ -288,10 +303,23 @@ fn verify_ace(acl: *mut ACL, index: u32, user: PSID, acl_size: usize) -> Result<
             let valid = unsafe { IsValidSid(sid) }.as_bool();
             ensure!(valid, "invalid allow ACE SID");
             if !is_trusted_sid(sid, user) {
+                let permitted = UNTRUSTED_READ_ONLY
+                    | if root_sibling_create_candidate {
+                        ADD_SUBDIRECTORY
+                    } else {
+                        0
+                    };
                 ensure!(
-                    ace.Mask & !UNTRUSTED_READ_ONLY == 0,
+                    ace.Mask & !permitted == 0,
                     "untrusted principal has non-read access"
                 );
+                if ace.Mask & ADD_SUBDIRECTORY != 0 {
+                    ensure!(
+                        root_sibling_create_candidate
+                            && header.AceFlags & ACE_INHERITANCE_FLAGS == 0,
+                        "untrusted create-subdirectory grant is inheritable"
+                    );
+                }
             }
             Ok(())
         }
@@ -299,12 +327,13 @@ fn verify_ace(acl: *mut ACL, index: u32, user: PSID, acl_size: usize) -> Result<
     }
 }
 
+#[cfg(test)]
 fn verify_descriptor(
     descriptor: PSECURITY_DESCRIPTOR,
     user: PSID,
     require_protected: bool,
 ) -> Result<()> {
-    verify_descriptor_inner(descriptor, user, require_protected, true)
+    verify_descriptor_inner(descriptor, user, require_protected, true, false)
 }
 
 fn verify_descriptor_inner(
@@ -312,6 +341,7 @@ fn verify_descriptor_inner(
     user: PSID,
     require_protected: bool,
     require_owner: bool,
+    root_sibling_create_candidate: bool,
 ) -> Result<()> {
     // SAFETY: the descriptor is a live Windows-allocated security descriptor.
     let valid = unsafe { IsValidSecurityDescriptor(descriptor) }.as_bool();
@@ -363,7 +393,13 @@ fn verify_descriptor_inner(
     let header = unsafe { std::ptr::read_unaligned(acl) };
     ensure!(usize::from(header.AceCount) <= MAX_ACES, "too many ACEs");
     for index in 0..u32::from(header.AceCount) {
-        verify_ace(acl, index, user, usize::from(header.AclSize))?;
+        verify_ace(
+            acl,
+            index,
+            user,
+            usize::from(header.AclSize),
+            root_sibling_create_candidate,
+        )?;
     }
     Ok(())
 }
@@ -379,6 +415,29 @@ pub fn verify_directory_acl(
     directory: &File,
     user_sid: &[u8],
     require_protected: bool,
+) -> Result<()> {
+    inspect_directory_acl(directory, user_sid, require_protected, false)
+}
+
+/// Inspect an alleged volume-root ACL for the proposed sibling-creation case.
+/// A successful result is only an ACL candidate: it does not verify that the
+/// handle is a volume root, establish ancestry, check effective tokens or
+/// privileges, account for pre-existing handles, or authorize any operation.
+/// No production publication or ancestry gate may rely on this result until
+/// the concrete mechanism is independently reviewed and all gates pass.
+///
+/// # Errors
+/// Rejects all untrusted mutation grants except non-inheritable
+/// create-subdirectory, and rejects unsafe descriptors or directory handles.
+pub fn inspect_root_acl_candidate(directory: &File, user_sid: &[u8]) -> Result<()> {
+    inspect_directory_acl(directory, user_sid, false, true)
+}
+
+fn inspect_directory_acl(
+    directory: &File,
+    user_sid: &[u8],
+    require_protected: bool,
+    root_sibling_create_candidate: bool,
 ) -> Result<()> {
     directory_identity(directory)?;
     let mut user_words = sid_storage(user_sid)?;
@@ -405,7 +464,13 @@ pub fn verify_directory_acl(
         status.0
     );
     ensure!(!owned.0.0.is_null(), "missing security descriptor");
-    verify_descriptor(owned.0, user, require_protected)
+    verify_descriptor_inner(
+        owned.0,
+        user,
+        require_protected,
+        true,
+        root_sibling_create_candidate,
+    )
 }
 
 /// Open and inspect one directory component relative to a retained parent.
@@ -771,6 +836,36 @@ mod tests {
         let mut invalid = system_sid;
         invalid[1] = 15;
         let _invalid_sid = sid_storage(&invalid).unwrap_err();
+    }
+
+    #[test]
+    fn root_acl_candidate_allows_only_noninheritable_sibling_creation() {
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut words = sid_storage(&system_sid).unwrap();
+        let user = PSID(words.as_mut_ptr().cast());
+        let candidate = |sddl: &str| {
+            let descriptor = descriptor(sddl);
+            verify_descriptor_inner(descriptor.0, user, true, true, true)
+        };
+        candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;;FR;;;WD)(A;;0x4;;;WD)").unwrap();
+        for unsafe_ace in [
+            "(A;CI;0x4;;;WD)",
+            "(A;OI;0x4;;;WD)",
+            "(A;CIIO;0x4;;;WD)",
+            "(A;OICIIO;0xe0010000;;;AU)",
+            "(A;;0x6;;;WD)",
+            "(A;;0x44;;;WD)",
+            "(A;;GW;;;WD)",
+            "(A;;WD;;;WD)",
+            "(A;;WO;;;WD)",
+            "(A;;SD;;;WD)",
+        ] {
+            let sddl = format!("O:SYG:SYD:P(A;;FA;;;SY){unsafe_ace}");
+            assert!(candidate(&sddl).is_err(), "accepted {unsafe_ace}");
+        }
+        assert!(candidate("O:WDG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)").is_err());
+        let strict = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)");
+        assert!(verify_descriptor(strict.0, user, true).is_err());
     }
 
     #[test]

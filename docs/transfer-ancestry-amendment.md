@@ -1,18 +1,20 @@
 # Proposed amendment: distinguish sibling creation from ancestor control
 
-Status: **proposal for independent review; not accepted or enabled**. The
-existing transfer design remains authoritative. In particular, the current
-implementation must continue rejecting untrusted write rights throughout the
-ancestry until this amendment is independently accepted and its gates are
-implemented and tested. This document does not approve a destination or
-authorize a listener, credentials, ACL changes, or source deletion.
+Status: **design independently accepted; qualification mechanism not yet
+accepted or enabled**. The existing transfer design remains authoritative
+except for this narrow proposed qualification, which may be relied on only
+after independent review of its concrete mechanism and passing its gates and
+tests. The current publication path remains disabled. This document does not
+approve a destination or authorize a listener, credentials, ACL changes, or
+source deletion.
 
 ## Narrow proposed exception
 
 The existing design excludes other-user write and delete access throughout the
 trusted ancestry. Consider a single, explicitly approved local volume-root
-directory for which an otherwise untrusted principal has only the right to
-create a new subdirectory. Treat that one right as sibling-creation authority,
+directory for which the only permitted mutation right of an otherwise untrusted
+principal is the right to create a new subdirectory; read and traverse rights
+may also be present. Treat that mutation right as sibling-creation authority,
 not by itself as evidence that the principal can delete, rename, replace,
 reparse or modify an existing protected child. The exception must not apply to
 the destination parent, staging parent, staging directory, journal, final
