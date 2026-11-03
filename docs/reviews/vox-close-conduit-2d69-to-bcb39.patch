@@ -1,0 +1,465 @@
+diff --git a/rust/vox-core/src/bare_conduit/mod.rs b/rust/vox-core/src/bare_conduit/mod.rs
+index 3a39a1a0..ee174498 100644
+--- a/rust/vox-core/src/bare_conduit/mod.rs
++++ b/rust/vox-core/src/bare_conduit/mod.rs
+@@ -137,6 +137,10 @@ impl<F: MsgFamily, LTx: LinkTx + MaybeSend + 'static> ConduitTx for BareConduitT
+         self.link_tx.close().await
+     }
+ 
++    async fn close_shared_bounded(&self, budget: std::time::Duration) -> std::io::Result<()> {
++        self.link_tx.close_shared_bounded(budget).await
++    }
++
+     fn abort(&self) {
+         self.link_tx.abort();
+     }
+diff --git a/rust/vox-core/src/connection/mod.rs b/rust/vox-core/src/connection/mod.rs
+index 455597f1..20748f42 100644
+--- a/rust/vox-core/src/connection/mod.rs
++++ b/rust/vox-core/src/connection/mod.rs
+@@ -3765,6 +3765,12 @@ impl ConnectionCore {
+ 
+ pub trait DynConduitTx: MaybeSend + MaybeSync {
+     fn abort(&self) {}
++    fn close_shared_bounded(self: Arc<Self>, _budget: Duration) -> OutboundSend {
++        Box::pin(std::future::ready(Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "shared bounded close is not supported by this conduit",
++        ))))
++    }
+     fn prepare_msg<'a>(
+         self: Arc<Self>,
+         msg: Message<'a>,
+@@ -3788,6 +3794,9 @@ where
+     fn abort(&self) {
+         ConduitTx::abort(self);
+     }
++    fn close_shared_bounded(self: Arc<Self>, budget: Duration) -> OutboundSend {
++        Box::pin(async move { ConduitTx::close_shared_bounded(&*self, budget).await })
++    }
+     fn prepare_msg<'a>(
+         self: Arc<Self>,
+         msg: Message<'a>,
+@@ -3915,6 +3924,28 @@ mod tests {
+ 
+     struct PendingRx;
+ 
++    #[tokio::test]
++    async fn unsupported_type_erased_conduit_does_not_claim_shared_close() {
++        let shared: Arc<dyn DynConduitTx> = Arc::new(CapturingTx {
++            sent: Arc::new(Mutex::new(Vec::new())),
++        });
++        let error = shared
++            .close_shared_bounded(Duration::from_secs(1))
++            .await
++            .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
++
++        use vox_types::Conduit;
++        let (link, _peer) = crate::memory_link_pair(4);
++        let (tx, _rx) = crate::BareConduit::<MessageFamily, _>::new(link).split();
++        let shared: Arc<dyn DynConduitTx> = Arc::new(tx);
++        let error = shared
++            .close_shared_bounded(Duration::from_secs(1))
++            .await
++            .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
++    }
++
+     impl ConduitRx for PendingRx {
+         type Error = std::io::Error;
+         type Msg = MessageFamily;
+@@ -4189,6 +4220,148 @@ mod tests {
+         drop(lanes);
+     }
+ 
++    #[tokio::test]
++    #[ignore = "diagnostic: a retained lane can currently send after shutdown"]
++    async fn retained_lane_cannot_send_after_explicit_shutdown() {
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let (mut connection, _control) = make_capturing_connection(sent.clone());
++        let lanes = Arc::new(Mutex::new(Vec::new()));
++        connection.lane_acceptor = Some(Arc::new(RetainLanes(lanes.clone())));
++        connection
++            .handle_inbound_open(LaneId(2), inbound_open(1, 1))
++            .await;
++        let sender = {
++            let held = lanes.lock().unwrap();
++            assert_eq!(held.len(), 1);
++            held[0].sender.clone()
++        };
++        connection
++            .control_tx
++            .send(DropControlRequest::Shutdown)
++            .unwrap();
++        tokio::time::timeout(Duration::from_secs(2), connection.run())
++            .await
++            .unwrap();
++        drop(connection);
++        let count_before = sent.lock().unwrap().len();
++        let message = ConnectionMessage::Channel(vox_types::ChannelMessage {
++            id: vox_types::ChannelId(1),
++            body: vox_types::ChannelBody::Close(vox_types::ChannelClose {
++                metadata: Metadata::default(),
++            }),
++        });
++        let outcome = tokio::time::timeout(Duration::from_secs(2), sender.send(message))
++            .await
++            .unwrap();
++        outcome.expect_err("retained lane accepted an outbound message after shutdown");
++        assert_eq!(sent.lock().unwrap().len(), count_before);
++    }
++
++    #[tokio::test]
++    #[ignore = "diagnostic: shutdown currently leaves capacity-blocked producers waiting"]
++    async fn shutdown_wakes_producer_waiting_for_outbound_capacity() {
++        struct StalledTx(Mutex<Option<oneshot::Sender<()>>>);
++        impl ConduitTx for StalledTx {
++            type Error = std::io::Error;
++            type Msg = MessageFamily;
++            type Prepared = ();
++            fn prepare_send(&self, _: Message<'_>) -> Result<(), Self::Error> {
++                Ok(())
++            }
++            async fn send_prepared(&self, _: ()) -> Result<(), Self::Error> {
++                let started = self.0.lock().unwrap().take();
++                if let Some(started) = started {
++                    let _ = started.send(());
++                }
++                std::future::pending().await
++            }
++            async fn close(self) -> std::io::Result<()> {
++                Ok(())
++            }
++        }
++        fn channel() -> vox_types::ChannelMessage<'static> {
++            vox_types::ChannelMessage {
++                id: vox_types::ChannelId(1),
++                body: vox_types::ChannelBody::Close(vox_types::ChannelClose {
++                    metadata: Metadata::default(),
++                }),
++            }
++        }
++        let (_open_tx, open_rx) = mpsc::channel("shutdown_capacity.open", 1);
++        let (_close_tx, close_rx) = mpsc::channel("shutdown_capacity.close", 1);
++        let (control_tx, control_rx) = mpsc::unbounded_channel("shutdown_capacity.control");
++        let (started, started_rx) = oneshot::channel("shutdown_capacity.started");
++        let mut connection = Connection::pre_handshake(
++            StalledTx(Mutex::new(Some(started))),
++            PendingRx,
++            None,
++            open_rx,
++            close_rx,
++            control_tx.clone(),
++            control_rx,
++            None,
++            None,
++        );
++        let lane = connection
++            .establish_from_handshake(test_handshake(
++                ConnectionSettings {
++                    parity: Parity::Odd,
++                    max_concurrent_requests: 1,
++                    initial_channel_credit: 1,
++                },
++                ConnectionSettings {
++                    parity: Parity::Even,
++                    max_concurrent_requests: 1,
++                    initial_channel_credit: 1,
++                },
++            ))
++            .unwrap();
++        let sender = lane.sender.clone();
++        let first_sender = sender.clone();
++        let first = tokio::spawn(async move {
++            first_sender
++                .send(ConnectionMessage::Channel(channel()))
++                .await
++        });
++        tokio::time::timeout(Duration::from_secs(2), started_rx)
++            .await
++            .unwrap()
++            .unwrap();
++        let capacity = connection.connection_core.outbound_queue_stats().1;
++        for _ in 0..capacity {
++            sender
++                .try_send_channel_with_writer_schema(channel(), None)
++                .unwrap();
++        }
++        assert_eq!(
++            connection.connection_core.outbound_queue_stats(),
++            (capacity, capacity)
++        );
++        let blocked_sender = sender.clone();
++        let mut blocked = tokio::spawn(async move {
++            blocked_sender
++                .send(ConnectionMessage::Channel(channel()))
++                .await
++        });
++        assert!(
++            tokio::time::timeout(Duration::from_millis(50), &mut blocked)
++                .await
++                .is_err()
++        );
++        control_tx.send(DropControlRequest::Shutdown).unwrap();
++        tokio::time::timeout(Duration::from_secs(2), connection.run())
++            .await
++            .unwrap();
++        let outcome = tokio::time::timeout(Duration::from_millis(200), &mut blocked).await;
++        first.abort();
++        blocked.abort();
++        connection.outbound_abort.abort();
++        let result = outcome
++            .expect("shutdown left the capacity-blocked producer waiting")
++            .unwrap();
++        result.expect_err("shutdown allowed a capacity-blocked send to succeed");
++    }
++
+     #[tokio::test]
+     async fn rejected_lane_does_not_wait_forever_for_stalled_peer() {
+         struct StalledTx(Option<oneshot::Sender<()>>);
+diff --git a/rust/vox-stream/src/lib.rs b/rust/vox-stream/src/lib.rs
+index dceab51a..cce501b4 100644
+--- a/rust/vox-stream/src/lib.rs
++++ b/rust/vox-stream/src/lib.rs
+@@ -446,6 +446,7 @@ where
+                 writer_task,
+                 admission: vox_rt::sync::Mutex::new("stream_link_admission", false),
+                 close_claimed: AtomicBool::new(false),
++                terminal: AtomicBool::new(false),
+             },
+             StreamLinkRx {
+                 rx: read_rx,
+@@ -466,16 +467,19 @@ pub struct StreamLinkTx {
+     writer_task: JoinHandle<io::Result<()>>,
+     admission: vox_rt::sync::Mutex<bool>,
+     close_claimed: AtomicBool,
++    terminal: AtomicBool,
+ }
+ 
+ struct AbortCloseOnDrop<'a> {
+     writer: &'a JoinHandle<io::Result<()>>,
++    terminal: &'a AtomicBool,
+     completed: bool,
+ }
+ 
+ impl Drop for AbortCloseOnDrop<'_> {
+     fn drop(&mut self) {
+         if !self.completed {
++            self.terminal.store(true, Ordering::Release);
+             self.writer.abort();
+         }
+     }
+@@ -488,6 +492,9 @@ impl StreamLinkTx {
+     /// An abort is asynchronous and does not prove the writer has stopped.
+     /// The cutoff is setting the flag under `admission`, not claiming the close;
+     /// sends may be admitted while close waits for that mutex.
++    /// A failed or cancelled close sets `terminal` before aborting. A sender that
++    /// passed its final terminal check before that transition may still enqueue;
++    /// the abort can then cause that send to fail or have an uncertain outcome.
+     pub async fn close_shared_bounded(&self, budget: std::time::Duration) -> io::Result<()> {
+         if self.close_claimed.swap(true, Ordering::AcqRel) {
+             return Err(io::Error::new(
+@@ -497,6 +504,7 @@ impl StreamLinkTx {
+         }
+         let mut guard = AbortCloseOnDrop {
+             writer: &self.writer_task,
++            terminal: &self.terminal,
+             completed: false,
+         };
+         if budget.is_zero() {
+@@ -550,7 +558,7 @@ impl LinkTx for StreamLinkTx {
+         // r[impl link.tx.cancel-safe]
+         // r[impl link.message.empty]
+         let closed = self.admission.lock().await;
+-        if *closed {
++        if *closed || self.terminal.load(Ordering::Acquire) {
+             return Err(io::Error::new(
+                 io::ErrorKind::BrokenPipe,
+                 "stream already closing",
+@@ -559,6 +567,12 @@ impl LinkTx for StreamLinkTx {
+         let permit = self.tx.clone().reserve_owned().await.map_err(|_| {
+             io::Error::new(io::ErrorKind::ConnectionReset, "stream writer task stopped")
+         })?;
++        if self.terminal.load(Ordering::Acquire) {
++            return Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "stream is terminated",
++            ));
++        }
+         let (flushed, wait_for_flush) = oneshot::channel("stream_link_flushed");
+         drop(permit.send(QueuedWrite::Frame { bytes, flushed }));
+         drop(closed);
+@@ -575,7 +589,12 @@ impl LinkTx for StreamLinkTx {
+         self.writer_task.await.map_err(io::Error::other)?
+     }
+ 
++    async fn close_shared_bounded(&self, budget: std::time::Duration) -> io::Result<()> {
++        StreamLinkTx::close_shared_bounded(self, budget).await
++    }
++
+     fn abort(&self) {
++        self.terminal.store(true, Ordering::Release);
+         self.writer_task.abort();
+     }
+ }
+@@ -1115,6 +1134,7 @@ mod tests {
+             writer_task,
+             admission: vox_rt::sync::Mutex::new("stream_test_admission", false),
+             close_claimed: AtomicBool::new(false),
++            terminal: AtomicBool::new(false),
+         }
+     }
+ 
+@@ -1433,6 +1453,21 @@ mod tests {
+         assert!(other_rx.recv().await.unwrap().is_none());
+     }
+ 
++    #[tokio::test]
++    async fn shared_close_is_forwarded_through_type_erased_bare_conduit() {
++        use vox_types::Conduit;
++        let (a, b) = duplex_pair();
++        let (tx, _rx) = vox_core::BareConduit::<vox_types::MessageFamily, _>::new(a).split();
++        let shared: std::sync::Arc<dyn vox_core::DynConduitTx> = std::sync::Arc::new(tx);
++        let (_other_tx, mut other_rx) = b.split();
++        shared
++            .clone()
++            .close_shared_bounded(std::time::Duration::from_secs(2))
++            .await
++            .unwrap();
++        assert!(other_rx.recv().await.unwrap().is_none());
++    }
++
+     // r[verify link.tx.shared-close]
+     #[tokio::test]
+     async fn shared_close_waits_for_a_frame_already_in_flight() {
+@@ -1622,6 +1657,84 @@ mod tests {
+         let _send_error = sender.send(b"late".to_vec()).await.unwrap_err();
+     }
+ 
++    #[tokio::test]
++    async fn cancelled_close_denies_sender_blocked_before_abort_is_observed() {
++        let (tx, mut rx) = mpsc::channel::<QueuedWrite>("terminal_pending_admission", 1);
++        let (flushed, _wait) = oneshot::channel("terminal_occupied");
++        tx.try_send(QueuedWrite::Frame {
++            bytes: b"occupied".to_vec(),
++            flushed,
++        })
++        .unwrap();
++        // The receiver remains owned by this test, so aborting the fake writer
++        // does not close the queue. Rejection must come from terminal admission.
++        let sender = std::sync::Arc::new(test_sender(
++            tx,
++            vox_rt::spawn(async { std::future::pending::<io::Result<()>>().await }),
++        ));
++        let sending = sender.clone();
++        let pending_send = tokio::spawn(async move { sending.send(b"blocked".to_vec()).await });
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            while sender.admission.try_lock().is_ok() {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++        let closing = sender.clone();
++        let close = tokio::spawn(async move {
++            closing
++                .close_shared_bounded(std::time::Duration::from_secs(5))
++                .await
++        });
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            while !sender.close_claimed.load(Ordering::Acquire) {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++        close.abort();
++        let _cancelled = close.await.unwrap_err();
++        assert!(sender.terminal.load(Ordering::Acquire));
++        let QueuedWrite::Frame { bytes, .. } = rx.recv().await.unwrap() else {
++            panic!("expected occupied frame")
++        };
++        assert_eq!(bytes, b"occupied");
++        let error = tokio::time::timeout(std::time::Duration::from_secs(2), pending_send)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap_err();
++        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
++        assert!(matches!(
++            rx.try_recv(),
++            Err(mpsc::error::TryRecvError::Empty)
++        ));
++        assert_eq!(
++            sender.send(b"late".to_vec()).await.unwrap_err().kind(),
++            io::ErrorKind::BrokenPipe
++        );
++    }
++
++    #[tokio::test]
++    async fn abort_denies_send_even_while_receiver_is_still_held() {
++        let (tx, mut rx) = mpsc::channel::<QueuedWrite>("explicit_abort_admission", 1);
++        let sender = test_sender(
++            tx,
++            vox_rt::spawn(async { std::future::pending::<io::Result<()>>().await }),
++        );
++        sender.abort();
++        assert_eq!(
++            sender.send(b"late".to_vec()).await.unwrap_err().kind(),
++            io::ErrorKind::BrokenPipe
++        );
++        assert!(matches!(
++            rx.try_recv(),
++            Err(mpsc::error::TryRecvError::Empty)
++        ));
++    }
++
+     #[tokio::test]
+     async fn zero_budget_close_aborts_and_cannot_be_retried() {
+         let (a, _b) = duplex_pair();
+diff --git a/rust/vox-types/src/conduit.rs b/rust/vox-types/src/conduit.rs
+index 2bdd8e75..e1838092 100644
+--- a/rust/vox-types/src/conduit.rs
++++ b/rust/vox-types/src/conduit.rs
+@@ -66,6 +66,17 @@ pub trait ConduitTx {
+     where
+         Self: Sized;
+ 
++    /// Request bounded graceful close through a shared sender, if supported.
++    fn close_shared_bounded(
++        &self,
++        _budget: std::time::Duration,
++    ) -> impl Future<Output = std::io::Result<()>> + MaybeSend + '_ {
++        std::future::ready(Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "shared bounded close is not supported by this conduit",
++        )))
++    }
++
+     /// Abort outbound work without waiting for a graceful flush, if supported.
+     fn abort(&self) {}
+ }
+diff --git a/rust/vox-types/src/link.rs b/rust/vox-types/src/link.rs
+index f524468b..cd6b7850 100644
+--- a/rust/vox-types/src/link.rs
++++ b/rust/vox-types/src/link.rs
+@@ -71,6 +71,18 @@ pub trait LinkTx: MaybeSend + MaybeSync + 'static {
+     where
+         Self: Sized;
+ 
++    /// Request a bounded graceful close without consuming a shared sender.
++    /// Unsupported transports return an error and must not claim closure.
++    fn close_shared_bounded(
++        &self,
++        _budget: std::time::Duration,
++    ) -> impl Future<Output = std::io::Result<()>> + MaybeSend + '_ {
++        std::future::ready(Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "shared bounded close is not supported by this link",
++        )))
++    }
++
+     /// Abort outbound work without waiting for a graceful flush, if supported.
+     /// The default does nothing; transports may retain their own tasks after it.
+     fn abort(&self) {}
