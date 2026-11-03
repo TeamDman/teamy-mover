@@ -42,11 +42,16 @@ figue = { git = "https://github.com/TeamDman/facet.git", rev = "23ad4dcd0", pack
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
 ] }
 
 [features]
