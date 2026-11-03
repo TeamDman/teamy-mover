@@ -654,6 +654,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_three_file_staging_reaches_journal_intent_without_publication() {
+        use crate::transfer::windows_acl::{
+            create_private_child, create_private_file, create_synthetic_private_directory,
+        };
+        use crate::transfer::windows_lock::directory_identity;
+        use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = create_synthetic_private_directory(&dir.path().join("private")).unwrap();
+            let parent_id = directory_identity(&parent).unwrap();
+            let mut stage = create_private_child(&parent, parent_id, "stage").unwrap();
+            let stage_id = directory_identity(&stage).unwrap();
+            let journal_file = create_private_file(&parent, parent_id, "journal.bin").unwrap();
+            let journal_id = journal_file.identity();
+            let bodies: [&[u8]; 3] = [b"one", b"two", b"three"];
+            let ids = ["one", "two", "three"];
+            let names = ["one.bin", "two.bin", "three.bin"];
+            let mut sources = Vec::new();
+            let mut files = BTreeMap::new();
+            let mut entries = Vec::new();
+            let mut manifest_files = Vec::new();
+            for ((id, name), body) in ids.iter().zip(names).zip(bodies) {
+                let source_path = dir.path().join(format!("source-{id}"));
+                std::fs::write(&source_path, body).unwrap();
+                sources.push(Source::from_file((*id).to_owned(), File::open(&source_path).unwrap()));
+                let staged = create_private_file(&stage, stage_id, name).unwrap();
+                entries.push(ExpectedEntry { name, identity: staged.identity(), size: u64::try_from(body.len()).unwrap() });
+                files.insert((*id).to_owned(), staged);
+                let hash = format!("{:x}", Sha256::digest(body));
+                manifest_files.push(format!(r#"{{"id":"{id}","name":"{name}","sha256":"{hash}","size":{}}}"#, body.len()));
+            }
+            let expiry = now().unwrap() + 600;
+            let raw = format!(r#"{{"aggregate_bytes":11,"expires_unix":{expiry},"file_count":3,"files":[{}],"transaction_id":"{ID}","version":1}}"#, manifest_files.join(","));
+            let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+            let (client, server, client_pin, server_pin) = certificates();
+            let object = |id: crate::transfer::windows_lock::FileIdentity| ObjectIdentity {
+                volume_serial: id.volume_serial, file_index: id.file_index,
+            };
+            let approval = JournalApproval {
+                manifest_bytes: raw.as_bytes(), manifest_sha256: &digest, transaction_id: ID,
+                client_pin: &client_pin, server_pin: &server_pin,
+                destination_parent: object(parent_id), stage_directory: object(stage_id),
+                journal_file: object(journal_id), final_name: "published", now_unix: now().unwrap(),
+            };
+            let journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
+            let receiver = Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap();
+            let control = receiver.clone();
+            let (left, right) = tokio::io::duplex(128 * 1024);
+            let (client_tls, server_tls) = tokio::join!(client.connect(left), server.accept(right));
+            let (client_conn, server_conn) = tokio::join!(
+                vox_transport::establish_client(client_tls.unwrap()),
+                receiver.establish(server_tls.unwrap())
+            );
+            let client_conn = client_conn.unwrap();
+            let _server_conn = server_conn.unwrap();
+            send_prepublication(&client_conn, raw.as_bytes(), &digest, ID, sources).await.unwrap();
+            let mut receiver_state = control.state.lock().await;
+            for (id, expected) in ids.iter().zip(bodies) {
+                assert!(receiver_state.journal.as_ref().unwrap().has_observation(id));
+                let file = receiver_state.files.get_mut(*id).unwrap().file_mut();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let mut actual = Vec::new();
+                file.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, expected);
+            }
+            verify_entries(&mut stage, stage_id, &entries).unwrap();
+            // Test the existing journal primitive only; no publication permit
+            // or recovery guarantee follows from these synthetic checks.
+            let journal = receiver_state.journal.as_mut().unwrap();
+            journal.record_commit_intent(now().unwrap()).unwrap();
+            assert!(journal.intent_matches_directory(&stage).unwrap());
+            assert!(journal.commit().is_err());
+            drop(receiver_state);
+            assert!(matches!(control.commit(ID.into(), digest.clone()).await, Err(TransferError::NotReady)));
+            for (id, body) in ids.iter().zip(bodies) {
+                assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+            }
+        }).await.expect("protected receiver integration test timed out");
+    }
+
+    #[tokio::test]
     async fn timed_out_file_worker_keeps_handle_and_transaction_unavailable() {
         file_worker_interruption(false).await;
     }

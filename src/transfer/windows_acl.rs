@@ -981,6 +981,46 @@ pub fn create_private_child(
     Ok(child)
 }
 
+/// Construct only synthetic test fixtures. This path-based helper does not
+/// qualify ancestry and is never compiled into the operational library.
+#[cfg(test)]
+pub(crate) fn create_synthetic_private_directory(path: &std::path::Path) -> Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let security = private_directory_security()?;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())?,
+        lpSecurityDescriptor: security.0.0.0,
+        bInheritHandle: windows::core::BOOL(0),
+    };
+    // SAFETY: test path is NUL terminated and the descriptor remains live.
+    unsafe { CreateDirectoryW(windows::core::PCWSTR(wide.as_ptr()), Some(&raw const attrs))? };
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(
+            (READ_CONTROL
+                | SYNCHRONIZE
+                | FILE_LIST_DIRECTORY
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_ADD_FILE
+                | FILE_READ_ATTRIBUTES)
+                .0,
+        )
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?;
+    verify_directory_acl(&directory, &process_user_sid()?, true)?;
+    Ok(directory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
