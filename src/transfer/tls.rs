@@ -210,6 +210,11 @@ impl ClientEndpoint {
 }
 
 impl ServerEndpoint {
+    #[cfg(windows)]
+    pub(crate) const fn pins(&self) -> ([u8; 32], [u8; 32]) {
+        (self.server_pin, self.client_pin)
+    }
+
     pub(crate) fn matches_pins(&self, server_pin: &[u8; 32], client_pin: &[u8; 32]) -> bool {
         self.server_pin == *server_pin && self.client_pin == *client_pin
     }

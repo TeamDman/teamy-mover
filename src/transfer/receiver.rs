@@ -10,7 +10,7 @@ use super::journal::JournalApproval;
 use super::journal::JournalBinding;
 use super::manifest::ApprovedManifest;
 use super::manifest::parse_approved_manifest;
-use super::tls::AuthenticatedServer;
+use super::tls::{AuthenticatedServer, ServerEndpoint};
 use super::transaction_journal::TransactionJournal;
 use super::verified_stream::FileVerifier;
 use super::vox_transport::BoundedConnection;
@@ -111,6 +111,7 @@ impl State {
         digest: String,
         files: BTreeMap<String, ExclusiveFile>,
         io_gate: BlockingIoGate,
+        publication: Option<PublicationQualification>,
     ) -> Self {
         Self {
             journal: Some(journal),
@@ -120,7 +121,7 @@ impl State {
             begun: false,
             authenticated_connection: None,
             replay_permit: None,
-            publication: None,
+            publication,
             published_handles: None,
             in_flight_or_failed: false,
             deadline: tokio::time::Instant::now() + MAX_SESSION,
@@ -140,6 +141,14 @@ impl State {
 pub struct Receiver {
     state: Arc<Mutex<State>>,
     started: Arc<AtomicBool>,
+}
+
+/// Local outcome of a completed single-connection session. Neither variant
+/// proves that the peer received a response or that a rename is durable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReceiverSessionOutcome {
+    Incomplete,
+    PublishedDurabilityUnconfirmed,
 }
 
 impl std::fmt::Debug for Receiver {
@@ -176,10 +185,36 @@ impl Receiver {
     /// # Errors
     /// Rejects mismatched approval, missing files, unsafe claims and I/O errors.
     pub async fn prepare(
+        permit: StagingPermit,
+        journal: TransactionJournal,
+        approval: &JournalApproval<'_>,
+        files: BTreeMap<String, ExclusiveFile>,
+    ) -> Result<Self> {
+        Self::prepare_inner(permit, journal, approval, files, None).await
+    }
+
+    /// Prepare a receiver with a separately qualified publication capability.
+    /// No operational staging or publication constructor exists yet.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "awaiting the reviewed qualification constructor")
+    )]
+    pub(crate) async fn prepare_for_commit(
+        permit: StagingPermit,
+        journal: TransactionJournal,
+        approval: &JournalApproval<'_>,
+        files: BTreeMap<String, ExclusiveFile>,
+        publication: PublicationQualification,
+    ) -> Result<Self> {
+        Self::prepare_inner(permit, journal, approval, files, Some(publication)).await
+    }
+
+    async fn prepare_inner(
         _permit: StagingPermit,
         journal: TransactionJournal,
         approval: &JournalApproval<'_>,
         files: BTreeMap<String, ExclusiveFile>,
+        publication: Option<PublicationQualification>,
     ) -> Result<Self> {
         let _binding = JournalBinding::from_approval(approval)?;
         let manifest = parse_approved_manifest(
@@ -208,9 +243,11 @@ impl Receiver {
         let destination_parent = approval.destination_parent;
         let stage_directory = approval.stage_directory;
         let journal_file = approval.journal_file;
-        let gate = BlockingIoGate::default();
+        let gate = publication
+            .as_ref()
+            .map_or_else(BlockingIoGate::default, PublicationQualification::gate);
         let worker_gate = gate.clone();
-        let (journal, manifest, files) = gate
+        let (journal, manifest, files, publication) = gate
             .run(budget, move || {
                 let mut journal = journal;
                 let mut files = files;
@@ -232,6 +269,10 @@ impl Receiver {
                     journal.matches_approval(&approval)?,
                     "journal approval mismatch"
                 );
+                if let Some(qualified) = &publication {
+                    check_worker_deadline(&worker_gate, deadline, manifest.expires_unix())?;
+                    qualified.check_binding(&mut journal)?;
+                }
                 ensure!(files.len() == manifest.files().len(), "file set mismatch");
                 for approved in manifest.files() {
                     check_worker_deadline(&worker_gate, deadline, manifest.expires_unix())?;
@@ -256,7 +297,7 @@ impl Receiver {
                     }
                 }
                 check_worker_deadline(&worker_gate, deadline, manifest.expires_unix())?;
-                Ok((journal, manifest, files))
+                Ok((journal, manifest, files, publication))
             })
             .await?;
         Ok(Self {
@@ -266,6 +307,7 @@ impl Receiver {
                 approval.manifest_sha256.to_owned(),
                 files,
                 gate,
+                publication,
             ))),
             started: Arc::new(AtomicBool::new(false)),
         })
@@ -277,6 +319,24 @@ impl Receiver {
     /// # Errors
     /// Rejects mismatched client certificates, repeated starts or Vox failure.
     pub async fn establish<S>(self, stream: AuthenticatedServer<S>) -> Result<BoundedConnection>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.claim_connection()?;
+        self.establish_claimed(stream).await
+    }
+
+    fn claim_connection(&self) -> Result<()> {
+        ensure!(
+            self.started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "receiver connection already started"
+        );
+        Ok(())
+    }
+
+    async fn establish_claimed<S>(self, stream: AuthenticatedServer<S>) -> Result<BoundedConnection>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -295,17 +355,102 @@ impl Receiver {
         };
         ensure!(client_matches, "client certificate does not match journal");
         ensure!(server_matches, "server certificate does not match journal");
-        ensure!(
-            self.started
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "receiver connection already started"
-        );
         let state = Arc::clone(&self.state);
         let connection =
             vox_transport::establish_server(stream, TransferWireDispatcher::new(self)).await?;
         state.lock().await.authenticated_connection = Some(connection.clone());
         Ok(connection)
+    }
+
+    /// Accept exactly one connection at the approved tailnet address. The
+    /// caller still needs a separately qualified staging/publication permit;
+    /// closure or timeout does not prove peer receipt or durable publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "awaiting an operational qualification constructor"
+        )
+    )]
+    pub(crate) async fn serve_once(
+        self,
+        target: &super::proxy::LocalDirectTarget,
+        tls: &ServerEndpoint,
+    ) -> Result<ReceiverSessionOutcome> {
+        let address = target.bind_address();
+        target.check_server(address, tls)?;
+        let deadline = {
+            let state = tokio::time::timeout(MAX_IDLE, self.state.lock()).await?;
+            check(&state, state.manifest.transaction_id(), &state.digest)
+                .map_err(|_error| eyre::eyre!("receiver session unavailable"))?;
+            ensure!(
+                state.publication.is_some(),
+                "publication qualification unavailable"
+            );
+            let journal = state
+                .journal
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("journal unavailable"))?;
+            let (server_pin, client_pin) = tls.pins();
+            ensure!(
+                journal.matches_server_pin(&server_pin) && journal.matches_client_pin(&client_pin),
+                "TLS pins do not match journal"
+            );
+            let wall_expiry = UNIX_EPOCH
+                .checked_add(Duration::from_secs(state.manifest.expires_unix()))
+                .ok_or_else(|| eyre::eyre!("invalid approval expiry"))?;
+            let remaining = wall_expiry
+                .duration_since(SystemTime::now())
+                .map_err(|_error| eyre::eyre!("approval expired"))?;
+            let expiry = tokio::time::Instant::now()
+                .checked_add(remaining)
+                .ok_or_else(|| eyre::eyre!("invalid approval expiry"))?;
+            state.deadline.min(expiry)
+        };
+        self.claim_connection()?;
+        let control = self.clone();
+        tokio::time::timeout_at(deadline, async move {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            target.check_server(listener.local_addr()?, tls)?;
+            let (socket, _peer) = listener.accept().await?;
+            drop(listener);
+            let stream = tls.accept(socket).await?;
+            let connection = self.establish_claimed(stream).await?;
+            let guard = StopConnectionOnDrop(Some(connection));
+            guard
+                .0
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("connection unavailable"))?
+                .closed()
+                .await;
+            drop(guard);
+            let state = control.state.lock().await;
+            ensure!(
+                !state.in_flight_or_failed,
+                "publication outcome requires inspection"
+            );
+            Ok::<_, eyre::Report>(if state.published_handles.is_some() {
+                ReceiverSessionOutcome::PublishedDurabilityUnconfirmed
+            } else {
+                ReceiverSessionOutcome::Incomplete
+            })
+        })
+        .await
+        .map_err(|_error| {
+            eyre::eyre!("receiver deadline expired; publication may require inspection")
+        })?
+    }
+}
+
+/// Request teardown on cancellation or return. A request is not proof that the
+/// peer received data or that all transport tasks stopped.
+struct StopConnectionOnDrop(Option<BoundedConnection>);
+
+impl Drop for StopConnectionOnDrop {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            let _requested = connection.shutdown();
+        }
     }
 }
 
@@ -671,7 +816,6 @@ mod tests {
     use crate::transfer::sender::Source;
     use crate::transfer::sender::send_prepublication;
     use crate::transfer::tls::ClientEndpoint;
-    use crate::transfer::tls::ServerEndpoint;
     use crate::transfer::windows_lock::regular_file_identity;
     use rcgen::BasicConstraints;
     use rcgen::CertificateParams;
@@ -876,6 +1020,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_listener_refuses_unqualified_receiver_before_bind() {
+        let fixture = fixture(false, false).await;
+        let (server_pin, client_pin) = fixture.server.pins();
+        let target = crate::transfer::proxy::LocalDirectTarget::new(
+            "100.64.0.1:49152".parse().unwrap(),
+            server_pin,
+            client_pin,
+        )
+        .unwrap();
+        let control = fixture.receiver.clone();
+        let error = fixture
+            .receiver
+            .serve_once(&target, &fixture.server)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("publication qualification unavailable")
+        );
+        assert!(!control.started.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&fixture.source).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn one_shot_listener_rejects_mismatched_tls_pins_before_bind() {
+        let fixture = fixture(false, false).await;
+        let (_server_pin, client_pin) = fixture.server.pins();
+        let target = crate::transfer::proxy::LocalDirectTarget::new(
+            "100.64.0.1:49152".parse().unwrap(),
+            [0; 32],
+            client_pin,
+        )
+        .unwrap();
+        let control = fixture.receiver.clone();
+        let error = fixture.receiver.serve_once(&target, &fixture.server).await.unwrap_err();
+        assert!(error.to_string().contains("receiver address or TLS identity"));
+        assert!(!control.started.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(&fixture.source).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
     async fn protected_three_file_staging_reaches_journal_intent_without_publication() {
         protected_three_file_simulation(false, false, None, false).await;
     }
@@ -922,13 +1108,27 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual NTFS post-close content injection probe; synthetic permit only"]
     async fn file_content_changed_after_close_does_not_get_a_receipt() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileContentAfterClose).await;
+        protected_three_file_simulation_inner(
+            true,
+            false,
+            None,
+            false,
+            CommitMode::FileContentAfterClose,
+        )
+        .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS post-close identity replacement probe; synthetic permit only"]
     async fn file_replaced_after_close_does_not_get_a_receipt() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileIdentityAfterClose).await;
+        protected_three_file_simulation_inner(
+            true,
+            false,
+            None,
+            false,
+            CommitMode::FileIdentityAfterClose,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -967,6 +1167,18 @@ mod tests {
     async fn qualified_commit_rpc_with_production_sender() {
         protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcProduction)
             .await;
+    }
+
+    #[tokio::test]
+    async fn qualified_receiver_preparation_rejects_wrong_target() {
+        protected_three_file_simulation_inner(
+            true,
+            false,
+            None,
+            false,
+            CommitMode::WrongQualification,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1163,6 +1375,7 @@ mod tests {
         RpcCollision,
         RpcProduction,
         RpcDisconnect,
+        WrongQualification,
     }
 
     async fn protected_three_file_simulation(
@@ -1256,14 +1469,33 @@ mod tests {
                 journal_file: object(journal_id), final_name: "published", now_unix: now().unwrap(),
             };
             let journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
-            let receiver = Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap();
+            let mut stage = Some(stage);
+            let mut parent = Some(parent);
+            let receiver = if matches!(mode, CommitMode::RpcProduction | CommitMode::WrongQualification) {
+                let gate = BlockingIoGate::default();
+                let final_name = if mode == CommitMode::WrongQualification { "wrong" } else { "published" };
+                let qualified = synthetic_publication_qualification(stage.take().unwrap(), parent.take().unwrap(), gate, final_name);
+                let result = Receiver::prepare_for_commit(StagingPermit(()), journal, &approval, files, qualified).await;
+                if mode == CommitMode::WrongQualification {
+                    let _rejected = result.unwrap_err();
+                    assert!(!dir.path().join("private/published").exists());
+                    assert!(!dir.path().join("private/wrong").exists());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
+                    return;
+                }
+                result.unwrap()
+            } else {
+                Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap()
+            };
             let control = receiver.clone();
             if mode == CommitMode::RpcDisconnect {
                 let (release, wait) = std::sync::mpsc::channel::<()>();
                 let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
                 let mut receiver_guard = control.state.lock().await;
                 let gate = receiver_guard.io_gate.clone();
-                receiver_guard.publication = Some(synthetic_publication_qualification(stage, parent, gate, "published"));
+                receiver_guard.publication = Some(synthetic_publication_qualification(stage.take().unwrap(), parent.take().unwrap(), gate, "published"));
                 receiver_guard.before_commit_rename = Some(Box::new(move || {
                     let _started = started.send(());
                     let _released = wait.recv();
@@ -1343,17 +1575,18 @@ mod tests {
             }
             if matches!(mode, CommitMode::Rpc | CommitMode::RpcCollision | CommitMode::RpcProduction) {
                 if mode == CommitMode::RpcCollision {
-                    let existing = create_private_child(&parent, parent_id, "published").unwrap();
+                    let existing = create_private_child(parent.as_ref().unwrap(), parent_id, "published").unwrap();
                     let existing_id = directory_identity(&existing).unwrap();
                     let mut marker = create_private_file(&existing, existing_id, "existing.bin").unwrap();
                     marker.file_mut().write_all(b"already here").unwrap();
                     drop(marker);
                     drop(existing);
                 }
-                let mut receiver_guard = control.state.lock().await;
-                let gate = receiver_guard.io_gate.clone();
-                receiver_guard.publication = Some(synthetic_publication_qualification(stage, parent, gate, "published"));
-                drop(receiver_guard);
+                if mode != CommitMode::RpcProduction {
+                    let mut receiver_guard = control.state.lock().await;
+                    let gate = receiver_guard.io_gate.clone();
+                    receiver_guard.publication = Some(synthetic_publication_qualification(stage.take().unwrap(), parent.take().unwrap(), gate, "published"));
+                }
                 let (left, mut right) = tokio::io::duplex(128 * 1024);
                 let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
                 let proxy_and_receiver = async move {
@@ -1425,6 +1658,8 @@ mod tests {
                 }
                 return;
             }
+            let stage = stage.unwrap();
+            let parent = parent.unwrap();
             // A synthetic CONNECT tunnel exercises the actual bounded sender,
             // mutual TLS, Vox driver and journal-backed receiver together.
             // The fake stage permit and in-memory tunnel do not qualify a live

@@ -50,6 +50,22 @@ pub(crate) struct PublicationQualification {
 }
 
 impl PublicationQualification {
+    /// Use the same single-flight gate for staging and publication. This does
+    /// not create or qualify the permit.
+    pub(crate) fn gate(&self) -> BlockingIoGate {
+        self.permit.0.clone()
+    }
+
+    /// Check the bound journal identities before exposing a prepared receiver.
+    /// A successful check does not prove ancestry or authorize publication.
+    pub(crate) fn check_binding(&self, journal: &mut TransactionJournal) -> Result<()> {
+        ensure!(
+            !self.ancestry.is_empty() && self.ancestry.len() <= 64,
+            "invalid retained ancestry"
+        );
+        journal.check_pre_intent_target(&self.destination_parent, &self.stage, &self.final_name)
+    }
+
     pub(crate) fn bind(
         self,
         journal: TransactionJournal,
@@ -238,7 +254,13 @@ struct RetainedDestination {
 // reopened final file still has its approved identity, hash and stream set.
 // Keep the receipt path closed until the handle-relative, deadline-bound final
 // re-verification implementation and its independent review are complete.
-#[cfg_attr(test, expect(clippy::unnecessary_wraps, reason = "production receipt gate stays closed"))]
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "production receipt gate stays closed"
+    )
+)]
 fn require_post_rename_file_verification() -> Result<()> {
     #[cfg(not(test))]
     eyre::bail!("post-rename verification is awaiting independent review");
