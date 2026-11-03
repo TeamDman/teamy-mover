@@ -65,7 +65,7 @@ fn direct_sender_requires_local_approval_before_connecting() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("manifest file required"));
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout, []);
     assert_eq!(std::fs::read(&config).unwrap(), b"{}");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
