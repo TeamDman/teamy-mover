@@ -749,6 +749,16 @@ mod tests {
         verify_descriptor(safe.0, user, true).unwrap();
         let writable = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;FW;;;WD)");
         assert!(verify_descriptor(writable.0, user, true).is_err());
+        // The proposed root-only sibling-creation exception is not yet
+        // approved or implemented: the current filter still rejects it.
+        let sibling_create = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)");
+        assert!(verify_descriptor(sibling_create.0, user, true).is_err());
+        let delete_child = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x40;;;WD)");
+        assert!(verify_descriptor(delete_child.0, user, true).is_err());
+        let write_dacl = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;WD;;;WD)");
+        assert!(verify_descriptor(write_dacl.0, user, true).is_err());
+        let write_owner = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;WO;;;WD)");
+        assert!(verify_descriptor(write_owner.0, user, true).is_err());
         let deleted = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;SD;;;WD)");
         assert!(verify_descriptor(deleted.0, user, true).is_err());
         let owner = descriptor("O:WDG:SYD:P(A;;FA;;;SY)");
