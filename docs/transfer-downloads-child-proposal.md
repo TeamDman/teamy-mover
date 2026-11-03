@@ -49,8 +49,12 @@ Downloads path after crash, exit or handle release.
    configuration, that a pre-existing delete-capable handle causes a sharing
    failure and that later competing rename/delete opens cannot succeed while
    this handle is held. If a required open conflicts, stop; do not close the
-   guard to make a rename work. Audit and test whether a no-write-sharing guard
-   is needed and workable; do not assume it covers all attribute or EA writes.
+   guard to make a rename work. An attributes-only handle is not sufficient:
+   the candidate must request access that participates in sharing checks, such
+   as `FILE_LIST_DIRECTORY`, and omit `FILE_SHARE_DELETE`. Test actual granted
+   access and sharing, not merely the requested flags. Audit and test whether a
+   no-write-sharing guard is needed and workable; do not assume it covers all
+   attribute, EA, named-stream or reparse writes.
 3. Before any listener, create the separate private work root, journal and
    transaction lock with explicit restrictive descriptors **at creation**,
    rather than inherited Downloads permissions. Bind their volume/file IDs,
@@ -62,23 +66,43 @@ Downloads path after crash, exit or handle release.
    restrictive descriptors, exclusive/no-follow semantics and sharing modes
    preventing concurrent writes and deletes while held. Stream one approved
    file at a time under the existing quotas; verify its exact byte count and
-   SHA-256. Reject extra entries, reparse points and hard links. Immediately
-   before commit, verify all file and directory identities, exact set, link
-   counts, hashes, current parent and named-edge identities, effective security
-   and final-name absence. Recheck applicable conditions after publication.
+   SHA-256. Reject extra entries, reparse points and hard links. Enumerate data
+   streams completely and reject any unapproved named stream on every staged
+   file, the stage directory, the dedicated work/journal directories and
+   Downloads itself as destination parent; verify the final directory after
+   rename. Existing unapproved streams on Downloads also fail closed. The
+   approved files have only their expected unnamed data streams; transaction
+   directories have no approved named data streams. Use a supported, complete
+   NTFS enumeration method that distinguishes named `$DATA` streams from
+   directory/index metadata and does not follow an untrusted replacement path.
+   Unsupported, incomplete, truncated, inaccessible or ambiguous enumeration
+   fails closed. Do not assume hashing the unnamed stream covers named streams.
+   Immediately before commit, verify all file and directory identities, exact
+   set, link counts, streams, hashes, current parent and named-edge identities,
+   effective security and final-name absence. Recheck after publication. These
+   checks do not replace proof that untrusted attribute, EA, stream or reparse
+   mutation is excluded throughout the critical window; fail closed if it is
+   possible or if the protection cannot be established.
 5. Persist commit-intent with the pre-rename stage identity. On the qualified
    same volume, use a tested handle-relative atomic no-replace rename from the
    private stage to the retained Downloads handle. Hold the transaction lock,
    stage directory and qualified destination/ancestry handles throughout.
    Child file handles may be closed only in the existing narrowly approved
-   same-account non-interference window when NTFS requires it. Retain and
-   quarantine all resources while a rename or journal I/O may be in flight;
-   neither timeouts nor cancellation permit retry while its outcome is unknown.
+   same-account non-interference window when NTFS requires it. Keep other-user
+   stream and content mutation excluded throughout that interval; test attempts
+   to add or change named streams after verification and before rename. Retain
+   the transaction lock, stage, journal, destination parent and every qualified
+   ancestry handle, including I/O buffers and worker ownership, until pending
+   rename or journal I/O settles or the one bounded transaction is quarantined.
+   A timeout, cancellation or abort signal does not prove the operation stopped
+   or permit a concurrent retry. Quarantine retains all such resources until
+   confirmed completion or process termination. After confirmed termination,
+   reacquire the lock and reconcile the outcome before any further action.
    A collision or failed check must not overwrite a destination.
 6. Record publication only after checking that the final directory is the
-   original stage identity and that the exact approved file set and hashes
-   remain intact. A successful local rename can be reported only as durability
-   unconfirmed unless the separate durability gates are met. Never delete the
+   original stage identity and that the exact approved file set, streams and
+   hashes remain intact. A successful local rename can be reported only as
+   durability unconfirmed unless the separate durability gates are met. Never delete the
    cloud sources. TLS still requires normal certificate validation and exact
    client/server pins; tailnet membership is not transaction authentication.
 
@@ -105,9 +129,10 @@ access, or delete source data in that state.
 
 For a possible crash after rename but before its record, compare the final
 directory volume and file ID to the stage ID in commit-intent, then verify the
-exact regular-file set, identities, link counts, reparse restrictions, lengths
-and hashes before a durability-unconfirmed receipt is considered. A mismatch,
-failed journal sync, still-running I/O or inconclusive state remains uncertain.
+exact regular-file set, identities, link counts, reparse restrictions, all
+relevant data streams, lengths and hashes before a durability-unconfirmed
+receipt is considered. A mismatch, failed journal sync, still-running I/O or
+inconclusive state remains uncertain.
 Loss or movement of the folder after the live handles are released is not
 prevented by this proposal and is not evidence of durable publication.
 
@@ -118,9 +143,25 @@ implementation. Synthetic, temporary NTFS tests must cover: explicit ACL at
 creation and denied effective access for distinct constrained principals;
 pre-opened DELETE, write and ACL-capable handles; sharing conflicts; rename of
 Downloads and its ancestors before/during/after guard acquisition; attempts to
-change attributes, EAs and reparse data; identity swaps; hard links; existing
-final names; write/rename cancellation and pending I/O; process exit at each
-journal/rename boundary; and local recovery after Downloads is moved or replaced.
+change attributes, EAs and reparse data on Downloads while its proposed live
+handle is held; identity swaps; hard links; existing final names; write/rename
+cancellation and pending I/O; process exit at each journal/rename boundary; and
+local recovery after Downloads is moved or replaced. Test all applicable
+constrained-token combinations and revalidate directory type, volume/file ID,
+named parent edge, security and stream state after attempted mutation. A failed
+attack or compatible handle for one token is not proof for other tokens; if
+the required protection is unproven, fail closed.
+
+Add synthetic alternate-stream tests for staged files and transaction-relevant
+directories, including zero-length and nonempty streams, enumeration failures,
+and injection attempts after child verification while child file handles are
+closed. Test final-directory stream verification after rename and after a
+simulated crash/reopen; unexpected or unenumerable streams must prevent a
+success receipt and preserve all sources and evidence. Exercise delayed
+completion and cancellation in both rename and journal sync, confirming that
+stage, journal, lock, destination and ancestry handles remain held or boundedly
+quarantined, and that no retry begins until completion or process termination
+followed by identity/content/stream reconciliation.
 Include the expected case where the required guard cannot be obtained. Tests must
 not modify the actual Downloads ACL or other existing user data. Simulated
 restarts are not power-loss durability proof. No operational constructor,
