@@ -2,10 +2,12 @@ pub mod facet_shape;
 pub mod global_args;
 pub mod output;
 pub mod plan;
+pub mod transfer;
 
 use crate::cli::global_args::GlobalArgs;
 use crate::cli::output::CliOutput;
 use crate::cli::plan::PlanArgs;
+use crate::cli::transfer::TransferArgs;
 use arbitrary::Arbitrary;
 use eyre::Context;
 use facet::Facet;
@@ -59,12 +61,17 @@ impl Cli {
 pub enum Command {
     /// Create, inspect, and validate move plans.
     Plan(PlanArgs),
+    /// Preview the disabled transfer command hierarchy.
+    Transfer(TransferArgs),
 }
 
 impl Command {
     #[must_use]
     pub const fn name(&self) -> &'static str {
-        "plan"
+        match self {
+            Self::Plan(_) => "plan",
+            Self::Transfer(_) => "transfer",
+        }
     }
     /// # Errors
     ///
@@ -73,6 +80,7 @@ impl Command {
         cancellation_scope.bail_if_cancelled()?;
         match self {
             Command::Plan(args) => args.invoke().await,
+            Command::Transfer(args) => args.invoke(),
         }
     }
 }
