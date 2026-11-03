@@ -30,6 +30,8 @@ pub mod windows_acl;
 #[cfg(windows)]
 pub mod windows_lock;
 #[cfg(windows)]
+pub(crate) mod windows_prepare;
+#[cfg(windows)]
 pub mod windows_process_limit;
 #[cfg(windows)]
 pub mod windows_publish;

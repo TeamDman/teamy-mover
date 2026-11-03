@@ -690,6 +690,21 @@ fn open_checked_child_with_sharing(
             0,
         )
     };
+    if status == STATUS_PENDING {
+        // A synchronous open should not pend. Keep all kernel-visible
+        // buffers and the caller-owned parent alive until process exit.
+        loop {
+            std::hint::black_box((
+                wide.as_ptr(),
+                &raw const object_name,
+                &raw const attributes,
+                &raw const raw,
+                &raw const status_block,
+                parent.as_raw_handle(),
+            ));
+            std::thread::park();
+        }
+    }
     if status.0 != 0 {
         if !raw.0.is_null() && raw.0 as isize != -1 {
             // SAFETY: any unexpected valid returned handle is uniquely owned.
@@ -887,6 +902,25 @@ pub fn create_private_file(
             0,
         )
     };
+    let pending = status == STATUS_PENDING;
+    #[cfg(test)]
+    let pending =
+        pending || (status.0 == 0 && std::env::var_os("TEAMY_TEST_PARK_FILE_CREATE").is_some());
+    if pending {
+        // Preserve the descriptor as well as the output and path buffers.
+        loop {
+            std::hint::black_box((
+                wide.as_ptr(),
+                &raw const object_name,
+                &raw const attributes,
+                &raw const raw,
+                &raw const status_block,
+                &security,
+                parent.as_raw_handle(),
+            ));
+            std::thread::park();
+        }
+    }
     if status.0 != 0 {
         if !raw.0.is_null() && raw.0 as isize != -1 {
             // SAFETY: any non-null, non-invalid handle returned is owned here.
@@ -1107,6 +1141,20 @@ pub fn create_private_child(
             0,
         )
     };
+    if status == STATUS_PENDING {
+        loop {
+            std::hint::black_box((
+                wide.as_ptr(),
+                &raw const object_name,
+                &raw const attributes,
+                &raw const raw,
+                &raw const status_block,
+                &security,
+                parent.as_raw_handle(),
+            ));
+            std::thread::park();
+        }
+    }
     if status.0 != 0 {
         if !raw.0.is_null() && raw.0 as isize != -1 {
             // SAFETY: a non-null, non-invalid handle returned by NtCreateFile
@@ -1199,6 +1247,70 @@ mod tests {
         CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     use windows::core::PCWSTR;
+
+    #[test]
+    fn synthetic_pending_create_child() {
+        let Some(root) = std::env::var_os("TEAMY_TEST_PARK_FILE_CREATE") else {
+            return;
+        };
+        let parent = std::fs::OpenOptions::new()
+            .access_mode(
+                (FILE_LIST_DIRECTORY
+                    | FILE_ADD_FILE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE)
+                    .0,
+            )
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(root)
+            .unwrap();
+        let id = directory_identity(&parent).unwrap();
+        let _unreachable = create_private_file(&parent, id, "held.bin");
+        panic!("synthetic pending operation unexpectedly returned");
+    }
+
+    #[test]
+    fn synthetic_pending_create_retains_handle_until_child_exit() {
+        struct StopChild(std::process::Child);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                let _killed = self.0.kill();
+                let _waited = self.0.wait();
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("private");
+        let parent = create_synthetic_private_directory(&root).unwrap();
+        let mut child = StopChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transfer::windows_acl::tests::synthetic_pending_create_child",
+                    "--nocapture",
+                ])
+                .env("TEAMY_TEST_PARK_FILE_CREATE", &root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let path = root.join("held.bin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            path.exists(),
+            "child did not reach synthetic pending operation"
+        );
+        let _locked = std::fs::File::open(&path).unwrap_err();
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [0_u8; 0]);
+        drop(parent);
+    }
 
     fn descriptor(sddl: &str) -> LocalDescriptor {
         let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
