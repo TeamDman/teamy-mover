@@ -198,6 +198,30 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "diagnostic: peer shutdown with a retained service lane is under investigation"]
+    async fn peer_shutdown_is_observed_while_service_lane_is_retained() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (client, server) = tokio::join!(
+            initiate(client_io),
+            accept(server_io, EchoDispatcher::new(EchoService))
+        );
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let lane: EchoClient = client.open_lane().await.unwrap();
+        client.shutdown().unwrap();
+        if tokio::time::timeout(Duration::from_secs(2), server.closed())
+            .await
+            .is_err()
+        {
+            drop(lane);
+            tokio::time::timeout(Duration::from_secs(2), server.closed())
+                .await
+                .expect("server did not observe shutdown after service lane was dropped");
+            panic!("server only observed shutdown after the service lane was dropped");
+        }
+    }
+
+    #[tokio::test]
     async fn receiver_rejects_peer_lane_with_excessive_limits() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let (client, server) = tokio::join!(
