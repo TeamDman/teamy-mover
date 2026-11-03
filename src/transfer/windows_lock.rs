@@ -63,6 +63,14 @@ pub fn regular_file_identity(file: &File) -> Result<FileIdentity> {
 }
 
 impl ExclusiveFile {
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    pub(crate) const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
     /// Open an existing approved file without sharing and bind it to its
     /// expected volume/file identity. The file is never created by this call.
     /// The caller must independently secure and identity-check every ancestor,

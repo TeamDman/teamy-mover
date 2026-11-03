@@ -11,6 +11,8 @@ mod receiver_model;
 pub mod recovery;
 pub mod session;
 pub mod tls;
+#[cfg(windows)]
+pub mod transaction_journal;
 pub mod verified_stream;
 pub mod vox_transport;
 #[cfg(windows)]
