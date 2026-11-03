@@ -56,6 +56,20 @@ struct LocalDescriptor(PSECURITY_DESCRIPTOR);
 /// administrators. It is not evidence of protected ancestry or publication.
 pub struct PrivateDirectorySecurity(LocalDescriptor);
 
+/// A newly created synchronous directory handle. This does not qualify the
+/// directory for staging or publication. Its file handle cannot be replaced
+/// by callers, preserving the synchronous-open property of this wrapper.
+#[derive(Debug)]
+pub struct CreatedDirectory(File);
+
+impl std::ops::Deref for CreatedDirectory {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for PrivateDirectorySecurity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrivateDirectorySecurity")
@@ -889,7 +903,7 @@ pub fn create_private_child(
     parent: &File,
     expected_parent: FileIdentity,
     name: &str,
-) -> Result<File> {
+) -> Result<CreatedDirectory> {
     ensure!(valid_component(name), "invalid private directory component");
     ensure_not_impersonating()?;
     let user = process_user_sid()?;
@@ -978,7 +992,7 @@ pub fn create_private_child(
             error.wrap_err("directory created but validation failed; preserve it for inspection")
         );
     }
-    Ok(child)
+    Ok(CreatedDirectory(child))
 }
 
 /// Construct only synthetic test fixtures. This path-based helper does not
@@ -1091,6 +1105,7 @@ mod tests {
         journal.verify_file("one", file.file_mut(), 1).unwrap();
         journal.record_commit_intent(2).unwrap();
         assert!(journal.intent_matches_directory(stage).unwrap());
+        let _expired = journal.check_publication_time().unwrap_err();
         assert!(journal.commit().is_err());
     }
 

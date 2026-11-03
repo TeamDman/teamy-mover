@@ -276,7 +276,7 @@ fn persisted_intent_matches_renamed_synthetic_stage_after_reopen() {
     assert_eq!(nt_rename_relative(&stage, &parent, "published").0, 0);
     drop(journal);
     let mut recovered = TransactionJournal::reopen(lock(), &approval).unwrap();
-    let mut published = OpenOptions::new()
+    let published = OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
@@ -285,7 +285,7 @@ fn persisted_intent_matches_renamed_synthetic_stage_after_reopen() {
     assert!(recovered.intent_matches_directory(&published).unwrap());
     assert!(!recovered.intent_matches_directory(&parent).unwrap());
     verify_entries(
-        &mut published,
+        &published,
         stage_id,
         &[ExpectedEntry {
             name: "a.bin",
@@ -304,7 +304,7 @@ fn persisted_intent_matches_renamed_synthetic_stage_after_reopen() {
     fs::write(final_path.join("extra.bin"), b"unexpected").unwrap();
     assert!(
         verify_entries(
-            &mut published,
+            &published,
             stage_id,
             &[ExpectedEntry {
                 name: "a.bin",

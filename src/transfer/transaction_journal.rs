@@ -682,6 +682,50 @@ impl TransactionJournal {
             && actual.file_index == recorded.file_index)
     }
 
+    /// Recheck the held journal and approved parent, stage and final component
+    /// before a gated rename. This is not evidence of safe staging or ancestry.
+    pub(crate) fn check_publication_binding(
+        &mut self,
+        parent: &File,
+        stage: &File,
+        name: &str,
+    ) -> Result<()> {
+        self.check_publication_time()?;
+        self.lock.verify()?;
+        ensure!(
+            read_log(&mut self.lock)? == self.records,
+            "journal changed while held"
+        );
+        let parent_id = directory_identity(parent)?;
+        ensure!(
+            self.binding.matches_publication_target(
+                ObjectIdentity {
+                    volume_serial: parent_id.volume_serial,
+                    file_index: parent_id.file_index,
+                },
+                name
+            ),
+            "publication parent or final name does not match approval"
+        );
+        ensure!(
+            self.intent_matches_directory(stage)?,
+            "stage identity does not match commit intent"
+        );
+        self.check_publication_time()
+    }
+
+    /// Recheck the absolute approval deadline immediately before issuing a
+    /// gated rename. A rename that completes after expiry is still an observed
+    /// filesystem change and must be reconciled without assuming a receipt.
+    pub(crate) fn check_publication_time(&self) -> Result<()> {
+        ensure!(!self.poisoned && !self.aborted, "journal unavailable");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        ensure!(now < self.manifest.expires_unix(), "approval expired");
+        Ok(())
+    }
+
     /// Publication and receipt generation are deliberately unavailable.
     ///
     /// # Errors

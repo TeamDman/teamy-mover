@@ -19,7 +19,7 @@ fn retained_directory_enumeration_rejects_mismatches_and_extra_entries() {
     fs::write(&second_path, b"second").unwrap();
     let first = regular_file_identity(&File::open(&first_path).unwrap()).unwrap();
     let second = regular_file_identity(&File::open(&second_path).unwrap()).unwrap();
-    let mut directory = OpenOptions::new()
+    let directory = OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(&directory_path)
@@ -37,8 +37,8 @@ fn retained_directory_enumeration_rejects_mismatches_and_extra_entries() {
             size: 6,
         },
     ];
-    verify_entries(&mut directory, directory_id, &entries).unwrap();
-    verify_entries(&mut directory, directory_id, &entries).unwrap();
+    verify_entries(&directory, directory_id, &entries).unwrap();
+    verify_entries(&directory, directory_id, &entries).unwrap();
 
     let wrong_size = [
         ExpectedEntry {
@@ -47,7 +47,7 @@ fn retained_directory_enumeration_rejects_mismatches_and_extra_entries() {
         },
         entries[1],
     ];
-    assert!(verify_entries(&mut directory, directory_id, &wrong_size).is_err());
+    assert!(verify_entries(&directory, directory_id, &wrong_size).is_err());
     let mut different = first;
     different.file_index ^= 1 << 63;
     let wrong_id = [
@@ -57,11 +57,11 @@ fn retained_directory_enumeration_rejects_mismatches_and_extra_entries() {
         },
         entries[1],
     ];
-    assert!(verify_entries(&mut directory, directory_id, &wrong_id).is_err());
-    assert!(verify_entries(&mut directory, directory_id, &entries[..1]).is_err());
+    assert!(verify_entries(&directory, directory_id, &wrong_id).is_err());
+    assert!(verify_entries(&directory, directory_id, &entries[..1]).is_err());
 
     fs::write(directory_path.join("extra.bin"), b"extra").unwrap();
-    assert!(verify_entries(&mut directory, directory_id, &entries).is_err());
+    assert!(verify_entries(&directory, directory_id, &entries).is_err());
     assert_eq!(fs::read(first_path).unwrap(), b"first");
     assert_eq!(fs::read(second_path).unwrap(), b"second");
 }

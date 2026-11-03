@@ -85,6 +85,11 @@ fn pin_is_valid(pin: &str) -> bool {
 
 impl JournalBinding {
     #[cfg(windows)]
+    pub(crate) fn matches_publication_target(&self, parent: ObjectIdentity, name: &str) -> bool {
+        self.0.destination_parent == parent && self.0.final_name == name
+    }
+
+    #[cfg(windows)]
     pub(crate) fn matches_client_pin(&self, pin: &[u8; 32]) -> bool {
         self.0.client_pin == Self::format_pin(pin)
     }

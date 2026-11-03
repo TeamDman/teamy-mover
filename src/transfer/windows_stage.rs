@@ -118,12 +118,14 @@ fn check_batch(
 /// Compare an open directory's immediate entries with the approved set.
 /// A match is only a directory-listing check, not a complete integrity or
 /// publication guarantee. Call with a directory handle opened for enumeration.
+/// Callers must serialize enumeration on this file object, including duplicate
+/// handles, because the operating system maintains an enumeration cursor.
 ///
 /// # Errors
 /// Rejects unexpected names, attributes, sizes or IDs, malformed enumeration
 /// data, unsafe directory identity, and unsupported filesystem operations.
 pub fn verify_entries(
-    directory: &mut File,
+    directory: &File,
     expected_directory: FileIdentity,
     entries: &[ExpectedEntry<'_>],
 ) -> Result<()> {
