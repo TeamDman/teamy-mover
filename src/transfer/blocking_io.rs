@@ -36,6 +36,16 @@ impl Drop for Flight {
 }
 
 impl BlockingIoGate {
+    /// A worker checks this between blocking operations. Cancellation cannot
+    /// interrupt an operation that already entered the operating system.
+    pub(crate) fn ensure_active(&self) -> Result<()> {
+        ensure!(
+            self.0.load(Ordering::Acquire) == ACTIVE,
+            "blocking I/O was cancelled or requires recovery"
+        );
+        Ok(())
+    }
+
     /// Run one blocking operation. A timeout, cancellation, panic, or I/O error
     /// poisons the gate permanently; the closure may still own resources until
     /// its operating-system call returns. This does not cancel the kernel call.
@@ -48,6 +58,9 @@ impl BlockingIoGate {
         F: FnOnce() -> Result<T> + Send + 'static,
     {
         ensure!(!deadline.is_zero(), "blocking I/O deadline expired");
+        let expires = std::time::Instant::now()
+            .checked_add(deadline)
+            .ok_or_else(|| eyre::eyre!("blocking I/O deadline overflow"))?;
         ensure!(
             self.0
                 .compare_exchange(IDLE, ACTIVE, Ordering::AcqRel, Ordering::Acquire)
@@ -60,6 +73,10 @@ impl BlockingIoGate {
         };
         let result = tokio::time::timeout(deadline, tokio::task::spawn_blocking(work)).await??;
         let value = result?;
+        ensure!(
+            std::time::Instant::now() < expires,
+            "blocking I/O deadline expired"
+        );
         flight.success = true;
         Ok(value)
     }

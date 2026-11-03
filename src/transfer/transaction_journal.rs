@@ -4,6 +4,7 @@
 //! power-loss durability. A commit-intent record is not permission to rename:
 //! publication and receipt records remain disabled until their gates exist.
 
+use super::blocking_io::BlockingIoGate;
 use super::journal::JournalApproval;
 use super::journal::JournalBinding;
 use super::journal::ObjectIdentity;
@@ -371,8 +372,12 @@ impl TransactionJournal {
     }
 
     fn persist(&mut self, event: Event, now: u64) -> Result<()> {
+        self.persist_with_clock(event, &|| Ok(now))
+    }
+
+    fn persist_with_clock(&mut self, event: Event, clock: &impl Fn() -> Result<u64>) -> Result<()> {
         ensure!(!self.poisoned && !self.aborted, "journal unavailable");
-        ensure!(now < self.manifest.expires_unix(), "approval expired");
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         let sequence = self
             .sequence
             .checked_add(1)
@@ -407,7 +412,11 @@ impl TransactionJournal {
             read_log(&mut self.lock)? == self.records,
             "journal changed while held"
         );
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         append(&mut self.lock, &frame)?;
+        // A write or sync can finish after the caller timed out. Leave this
+        // instance poisoned and the on-disk outcome for explicit inspection.
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         self.records.extend(frame);
         self.files = files;
         self.aborted = aborted;
@@ -424,15 +433,45 @@ impl TransactionJournal {
     /// # Errors
     /// Returns an error for unsafe, nonempty, conflicting or expired inputs.
     pub fn claim_empty_file(&mut self, id: &str, file: &mut ExclusiveFile, now: u64) -> Result<()> {
+        self.claim_empty_file_inner(id, file, &|| Ok(now))
+    }
+
+    pub(crate) fn claim_empty_file_before(
+        &mut self,
+        id: &str,
+        file: &mut ExclusiveFile,
+        deadline: std::time::Instant,
+        gate: &BlockingIoGate,
+    ) -> Result<()> {
+        self.claim_empty_file_inner(id, file, &|| {
+            gate.ensure_active()?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "claim deadline expired"
+            );
+            Ok(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs())
+        })
+    }
+
+    fn claim_empty_file_inner(
+        &mut self,
+        id: &str,
+        file: &mut ExclusiveFile,
+        clock: &impl Fn() -> Result<u64>,
+    ) -> Result<()> {
         ensure!(
             !self.poisoned
                 && !self.aborted
                 && self.commit_intent.is_none()
-                && now < self.manifest.expires_unix(),
+                && clock()? < self.manifest.expires_unix(),
             "journal unavailable"
         );
         self.lock.verify()?;
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         file.verify()?;
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         let approved = self
             .manifest
             .files()
@@ -460,9 +499,11 @@ impl TransactionJournal {
             );
             return Ok(());
         }
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         file.file_mut().sync_all()?;
+        ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         file.verify()?;
-        self.persist(Event::FileClaimed(observation), now)
+        self.persist_with_clock(Event::FileClaimed(observation), clock)
     }
 
     /// Verify a retained file handle's identity, exact length and digest, sync
@@ -472,7 +513,31 @@ impl TransactionJournal {
     /// # Errors
     /// Returns an error on mismatch, expiry, invalid identity or I/O failure.
     pub fn verify_file(&mut self, id: &str, file: &mut File, now: u64) -> Result<()> {
-        self.verify_file_inner(id, file, now, false)
+        self.verify_file_inner(id, file, &|| Ok(now), false)
+    }
+
+    pub(crate) fn verify_file_before(
+        &mut self,
+        id: &str,
+        file: &mut File,
+        deadline: std::time::Instant,
+        gate: &BlockingIoGate,
+    ) -> Result<()> {
+        self.verify_file_inner(
+            id,
+            file,
+            &|| {
+                gate.ensure_active()?;
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "verification deadline expired"
+                );
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs())
+            },
+            false,
+        )
     }
 
     /// Recheck a previously verified file after commit intent was recorded.
@@ -489,21 +554,21 @@ impl TransactionJournal {
             self.files.get(id).is_some_and(|entry| entry.verified),
             "prior verified file observation is missing"
         );
-        self.verify_file_inner(id, file, now, true)
+        self.verify_file_inner(id, file, &|| Ok(now), true)
     }
 
     fn verify_file_inner(
         &mut self,
         id: &str,
         file: &mut File,
-        now: u64,
+        clock: &impl Fn() -> Result<u64>,
         allow_intent: bool,
     ) -> Result<()> {
         ensure!(
             !self.poisoned
                 && !self.aborted
                 && (allow_intent || self.commit_intent.is_none())
-                && now < self.manifest.expires_unix(),
+                && clock()? < self.manifest.expires_unix(),
             "journal unavailable"
         );
         let approved = self
@@ -537,6 +602,10 @@ impl TransactionJournal {
         let mut verifier = FileVerifier::new(approved, std::io::sink());
         let mut buf = [0u8; 16 * 1024];
         loop {
+            ensure!(
+                clock()? < self.manifest.expires_unix(),
+                "verification authorization expired"
+            );
             let n = file.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -546,10 +615,14 @@ impl TransactionJournal {
         verifier.finish()?;
         file.sync_all()?;
         ensure!(identity(file)? == object, "file identity changed");
+        ensure!(
+            clock()? < self.manifest.expires_unix(),
+            "verification authorization expired"
+        );
         if self.files.get(id).is_some_and(|entry| entry.verified) {
             return Ok(());
         }
-        self.persist(Event::FileVerified(observation), now)
+        self.persist_with_clock(Event::FileVerified(observation), clock)
     }
 
     /// Persist cancellation without removing any file.

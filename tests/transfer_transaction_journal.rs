@@ -276,6 +276,8 @@ fn intent_matches_only_the_recorded_non_reparse_directory_handle() {
     journal.record_commit_intent(2).unwrap();
     assert!(journal.intent_matches_directory(&stage).unwrap());
     assert!(!journal.intent_matches_directory(&other).unwrap());
-    let _not_a_directory = journal.intent_matches_directory(&fixture.body()).unwrap_err();
+    let _not_a_directory = journal
+        .intent_matches_directory(&fixture.body())
+        .unwrap_err();
     assert!(journal.commit().is_err());
 }
