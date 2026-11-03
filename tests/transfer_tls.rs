@@ -246,8 +246,8 @@ trait SyntheticEcho {
 struct SyntheticEchoService;
 
 impl SyntheticEcho for SyntheticEchoService {
-    async fn echo(&self, value: String) -> String {
-        value
+    fn echo(&self, value: String) -> impl std::future::Future<Output = String> + Send {
+        std::future::ready(value)
     }
 }
 
@@ -398,16 +398,18 @@ impl TransferWire for MemoryTransfer {
         }
     }
 
-    async fn commit(
+    fn commit(
         &self,
         transaction_id: String,
         manifest_sha256: String,
-    ) -> Result<(), TransferError> {
-        if !self.matches(&transaction_id, &manifest_sha256) {
-            return Err(TransferError::Rejected);
-        }
+    ) -> impl std::future::Future<Output = Result<(), TransferError>> + Send {
         // This synthetic service cannot publish and must not report success.
-        Err(TransferError::NotReady)
+        let result = if self.matches(&transaction_id, &manifest_sha256) {
+            Err(TransferError::NotReady)
+        } else {
+            Err(TransferError::Rejected)
+        };
+        std::future::ready(result)
     }
 }
 

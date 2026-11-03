@@ -154,8 +154,8 @@ mod tests {
     struct EchoService;
 
     impl Echo for EchoService {
-        async fn echo(&self, value: String) -> String {
-            value
+        fn echo(&self, value: String) -> impl std::future::Future<Output = String> + Send {
+            std::future::ready(value)
         }
     }
 
