@@ -85,6 +85,11 @@ fn pin_is_valid(pin: &str) -> bool {
 
 impl JournalBinding {
     #[cfg(windows)]
+    pub(crate) fn receipt_context(&self) -> (&str, &str) {
+        (&self.0.manifest_sha256, &self.0.transaction_id)
+    }
+
+    #[cfg(windows)]
     pub(crate) fn matches_publication_target(&self, parent: ObjectIdentity, name: &str) -> bool {
         self.0.destination_parent == parent && self.0.final_name == name
     }

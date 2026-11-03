@@ -1,8 +1,8 @@
-//! Preliminary Windows transaction journal for verified file observations.
+//! Windows transaction journal for verified file observations.
 //!
 //! Records do not prove protected ancestry, safe staging, publication, or
 //! power-loss durability. A commit-intent record is not permission to rename:
-//! publication and receipt records remain disabled until their gates exist.
+//! publication evidence and receipts do not establish safe staging or durability.
 
 use super::blocking_io::BlockingIoGate;
 use super::journal::JournalApproval;
@@ -49,12 +49,59 @@ enum Event {
     FileVerified(FileObservation),
     CommitIntent(ObjectIdentity),
     Aborted,
+    Published(ObjectIdentity),
+    ReceiptRecorded(String),
 }
 
 #[derive(Clone)]
 struct FileEntry {
     observation: FileObservation,
     verified: bool,
+}
+
+#[derive(Clone, Default)]
+struct Progress {
+    aborted: bool,
+    commit_intent: Option<ObjectIdentity>,
+    published: Option<ObjectIdentity>,
+    receipt: Option<String>,
+}
+
+#[derive(Facet)]
+struct ReceiptFile<'a> {
+    id: &'a str,
+    sha256: &'a str,
+    size: u64,
+}
+
+#[derive(Facet)]
+struct Receipt<'a> {
+    files: Vec<ReceiptFile<'a>>,
+    manifest_sha256: &'a str,
+    outcome: &'static str,
+    transaction_id: &'a str,
+    version: u32,
+}
+
+fn expected_receipt(manifest: &ApprovedManifest, binding: &JournalBinding) -> Result<String> {
+    let (digest, transaction) = binding.receipt_context();
+    let files = manifest
+        .files()
+        .map(|file| ReceiptFile {
+            id: file.id(),
+            sha256: file.sha256(),
+            size: file.size(),
+        })
+        .collect();
+    let receipt = facet_json::to_string(&Receipt {
+        files,
+        manifest_sha256: digest,
+        outcome: "published-durability-unconfirmed",
+        transaction_id: transaction,
+        version: 1,
+    })?;
+    ensure!(receipt.len() <= 8 * 1024, "receipt exceeds limit");
+    Ok(receipt)
 }
 
 #[derive(Clone, Facet, PartialEq, Eq)]
@@ -66,9 +113,9 @@ struct Record {
     version: u32,
 }
 
-/// A retained exclusive journal handle and its validated pre-publication log.
-/// File observations must be revalidated on each restart; they are not staging
-/// access-control guarantees. No publication operation is exposed.
+/// A retained exclusive journal handle and its validated transaction log.
+/// Records must be revalidated on restart; they do not prove access control,
+/// a durable publication, or authorization to serve a recorded receipt.
 pub struct TransactionJournal {
     lock: ExclusiveFile,
     binding: JournalBinding,
@@ -78,9 +125,10 @@ pub struct TransactionJournal {
     records: Vec<u8>,
     sequence: u64,
     files: BTreeMap<String, FileEntry>,
-    aborted: bool,
-    commit_intent: Option<ObjectIdentity>,
+    progress: Progress,
     poisoned: bool,
+    #[cfg(test)]
+    before_receipt: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl std::fmt::Debug for TransactionJournal {
@@ -88,8 +136,10 @@ impl std::fmt::Debug for TransactionJournal {
         f.debug_struct("TransactionJournal")
             .field("sequence", &self.sequence)
             .field("file_count", &self.files.len())
-            .field("aborted", &self.aborted)
-            .field("has_commit_intent", &self.commit_intent.is_some())
+            .field("aborted", &self.progress.aborted)
+            .field("has_commit_intent", &self.progress.commit_intent.is_some())
+            .field("has_published_record", &self.progress.published.is_some())
+            .field("has_receipt", &self.progress.receipt.is_some())
             .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
@@ -160,20 +210,23 @@ fn approval(
 fn apply(
     event: &Event,
     manifest: &ApprovedManifest,
+    binding: &JournalBinding,
     reserved: &[ObjectIdentity; 3],
     files: &mut BTreeMap<String, FileEntry>,
-    aborted: &mut bool,
-    commit_intent: &mut Option<ObjectIdentity>,
+    progress: &mut Progress,
     sequence: u64,
 ) -> Result<()> {
     match event {
         Event::Approved => ensure!(
-            sequence == 1 && files.is_empty() && !*aborted && commit_intent.is_none(),
+            sequence == 1
+                && files.is_empty()
+                && !progress.aborted
+                && progress.commit_intent.is_none(),
             "invalid initial record"
         ),
         Event::FileClaimed(observation) | Event::FileVerified(observation) => {
             ensure!(
-                sequence > 1 && !*aborted && commit_intent.is_none(),
+                sequence > 1 && !progress.aborted && progress.commit_intent.is_none(),
                 "invalid file record"
             );
             let file = manifest
@@ -217,8 +270,8 @@ fn apply(
         Event::CommitIntent(stage) => {
             ensure!(
                 sequence > 1
-                    && !*aborted
-                    && commit_intent.is_none()
+                    && !progress.aborted
+                    && progress.commit_intent.is_none()
                     && *stage == reserved[1]
                     && files.len() == manifest.files().len()
                     && manifest
@@ -226,14 +279,37 @@ fn apply(
                         .all(|file| files.get(file.id()).is_some_and(|entry| entry.verified)),
                 "invalid commit intent"
             );
-            *commit_intent = Some(*stage);
+            progress.commit_intent = Some(*stage);
         }
         Event::Aborted => {
             ensure!(
-                sequence > 1 && !*aborted && commit_intent.is_none(),
+                sequence > 1 && !progress.aborted && progress.commit_intent.is_none(),
                 "invalid abort"
             );
-            *aborted = true;
+            progress.aborted = true;
+        }
+        Event::Published(stage) => {
+            ensure!(
+                sequence > 1
+                    && !progress.aborted
+                    && progress.commit_intent == Some(*stage)
+                    && progress.published.is_none()
+                    && progress.receipt.is_none(),
+                "invalid published record"
+            );
+            progress.published = Some(*stage);
+        }
+        Event::ReceiptRecorded(receipt) => {
+            ensure!(
+                sequence > 1
+                    && !progress.aborted
+                    && progress.published == progress.commit_intent
+                    && progress.published.is_some()
+                    && progress.receipt.is_none()
+                    && *receipt == expected_receipt(manifest, binding)?,
+                "invalid receipt record"
+            );
+            progress.receipt = Some(receipt.clone());
         }
     }
     Ok(())
@@ -281,9 +357,10 @@ impl TransactionJournal {
             records: frame,
             sequence: 1,
             files: BTreeMap::new(),
-            aborted: false,
-            commit_intent: None,
+            progress: Progress::default(),
             poisoned: false,
+            #[cfg(test)]
+            before_receipt: None,
         })
     }
 
@@ -299,8 +376,7 @@ impl TransactionJournal {
         let mut offset = 0usize;
         let mut sequence = 0u64;
         let mut files = BTreeMap::new();
-        let mut aborted = false;
-        let mut commit_intent = None;
+        let mut progress = Progress::default();
         while offset < bytes.len() {
             let remaining = &bytes[offset..];
             ensure!(
@@ -340,14 +416,14 @@ impl TransactionJournal {
             apply(
                 &record.event,
                 &manifest,
+                &binding,
                 &[
                     input.destination_parent,
                     input.stage_directory,
                     input.journal_file,
                 ],
                 &mut files,
-                &mut aborted,
-                &mut commit_intent,
+                &mut progress,
                 sequence,
             )?;
             offset += frame_end;
@@ -365,9 +441,10 @@ impl TransactionJournal {
             records: bytes,
             sequence,
             files,
-            aborted,
-            commit_intent,
+            progress,
             poisoned: false,
+            #[cfg(test)]
+            before_receipt: None,
         })
     }
 
@@ -376,22 +453,24 @@ impl TransactionJournal {
     }
 
     fn persist_with_clock(&mut self, event: Event, clock: &impl Fn() -> Result<u64>) -> Result<()> {
-        ensure!(!self.poisoned && !self.aborted, "journal unavailable");
+        ensure!(
+            !self.poisoned && !self.progress.aborted,
+            "journal unavailable"
+        );
         ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         let sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sequence overflow"))?;
         let mut files = self.files.clone();
-        let mut aborted = self.aborted;
-        let mut commit_intent = self.commit_intent;
+        let mut progress = self.progress.clone();
         apply(
             &event,
             &self.manifest,
+            &self.binding,
             &self.reserved,
             &mut files,
-            &mut aborted,
-            &mut commit_intent,
+            &mut progress,
             sequence,
         )?;
         let frame = encode(&Record {
@@ -419,8 +498,7 @@ impl TransactionJournal {
         ensure!(clock()? < self.manifest.expires_unix(), "approval expired");
         self.records.extend(frame);
         self.files = files;
-        self.aborted = aborted;
-        self.commit_intent = commit_intent;
+        self.progress = progress;
         self.sequence = sequence;
         self.poisoned = false;
         Ok(())
@@ -463,8 +541,8 @@ impl TransactionJournal {
     ) -> Result<()> {
         ensure!(
             !self.poisoned
-                && !self.aborted
-                && self.commit_intent.is_none()
+                && !self.progress.aborted
+                && self.progress.commit_intent.is_none()
                 && clock()? < self.manifest.expires_unix(),
             "journal unavailable"
         );
@@ -549,7 +627,10 @@ impl TransactionJournal {
     /// Returns an error if intent or the prior observation is missing, or if
     /// identity, content, expiry, or I/O checks fail.
     pub fn reverify_intent_file(&mut self, id: &str, file: &mut File, now: u64) -> Result<()> {
-        ensure!(self.commit_intent.is_some(), "commit intent is missing");
+        ensure!(
+            self.progress.commit_intent.is_some(),
+            "commit intent is missing"
+        );
         ensure!(
             self.files.get(id).is_some_and(|entry| entry.verified),
             "prior verified file observation is missing"
@@ -566,8 +647,8 @@ impl TransactionJournal {
     ) -> Result<()> {
         ensure!(
             !self.poisoned
-                && !self.aborted
-                && (allow_intent || self.commit_intent.is_none())
+                && !self.progress.aborted
+                && (allow_intent || self.progress.commit_intent.is_none())
                 && clock()? < self.manifest.expires_unix(),
             "journal unavailable"
         );
@@ -664,7 +745,7 @@ impl TransactionJournal {
     /// This is not evidence that a rename took place.
     #[must_use]
     pub const fn commit_intent_stage(&self) -> Option<ObjectIdentity> {
-        self.commit_intent
+        self.progress.commit_intent
     }
 
     /// Compare a retained, non-reparse directory handle to the recorded
@@ -675,6 +756,7 @@ impl TransactionJournal {
     /// Returns an error if commit intent is absent or the handle is unsafe.
     pub fn intent_matches_directory(&self, directory: &File) -> Result<bool> {
         let recorded = self
+            .progress
             .commit_intent
             .ok_or_else(|| eyre::eyre!("commit intent is missing"))?;
         let actual = directory_identity(directory)?;
@@ -691,6 +773,10 @@ impl TransactionJournal {
         name: &str,
     ) -> Result<()> {
         self.check_publication_time()?;
+        ensure!(
+            self.progress.published.is_none() && self.progress.receipt.is_none(),
+            "publication already recorded"
+        );
         self.lock.verify()?;
         ensure!(
             read_log(&mut self.lock)? == self.records,
@@ -718,7 +804,10 @@ impl TransactionJournal {
     /// gated rename. A rename that completes after expiry is still an observed
     /// filesystem change and must be reconciled without assuming a receipt.
     pub(crate) fn check_publication_time(&self) -> Result<()> {
-        ensure!(!self.poisoned && !self.aborted, "journal unavailable");
+        ensure!(
+            !self.poisoned && !self.progress.aborted,
+            "journal unavailable"
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
@@ -732,11 +821,221 @@ impl TransactionJournal {
         self.poisoned = true;
     }
 
-    /// Publication and receipt generation are deliberately unavailable.
+    pub(crate) fn approved_journal_identity(&self) -> ObjectIdentity {
+        self.reserved[2]
+    }
+
+    /// Persist a successful, locally observed publication and deterministic
+    /// unconfirmed-durability receipt. This method is reachable only with the
+    /// private evidence produced by the still-gated rename implementation.
+    /// A failed or expired write poisons this journal and requires recovery.
+    pub(crate) fn record_observed_publication(
+        &mut self,
+        evidence: super::windows_publish::ObservedPublication,
+        gate: &BlockingIoGate,
+    ) -> Result<()> {
+        let operation = (|| {
+            ensure!(
+                evidence.matches(
+                    self.reserved[0],
+                    self.reserved[1],
+                    self.reserved[2],
+                    &self.binding
+                ),
+                "publication evidence mismatch"
+            );
+            let clock = || {
+                gate.ensure_active()?;
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs())
+            };
+            self.persist_with_clock(Event::Published(self.reserved[1]), &clock)?;
+            #[cfg(test)]
+            if let Some(hook) = self.before_receipt.take() {
+                hook();
+            }
+            let receipt = expected_receipt(&self.manifest, &self.binding)?;
+            self.persist_with_clock(Event::ReceiptRecorded(receipt), &clock)
+        })();
+        if operation.is_err() {
+            self.poisoned = true;
+        }
+        operation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_receipt(&self) -> Option<&str> {
+        self.progress.receipt.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_published_record(&self) -> bool {
+        self.progress.published.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_receipt(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.before_receipt = Some(hook);
+    }
+
+    /// Operational publication and receipt replay remain unavailable.
     ///
     /// # Errors
     /// Always returns an error until the reviewed publication gates exist.
     pub fn commit(&self) -> Result<()> {
         bail!("publication is disabled")
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the complete publication and receipt transition sequence together"
+    )]
+    fn receipt_transition_requires_matching_published_identity_and_canonical_bytes() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let pin = "1111111111111111111111111111111111111111111111111111111111111111";
+        let hash = format!("{:x}", Sha256::digest(b"hello"));
+        let raw = format!(
+            r#"{{"aggregate_bytes":5,"expires_unix":100,"file_count":1,"files":[{{"id":"one","name":"one.bin","sha256":"{hash}","size":5}}],"transaction_id":"{id}","version":1}}"#
+        );
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        let parent = ObjectIdentity {
+            volume_serial: 1,
+            file_index: 1,
+        };
+        let stage = ObjectIdentity {
+            volume_serial: 1,
+            file_index: 2,
+        };
+        let journal = ObjectIdentity {
+            volume_serial: 1,
+            file_index: 3,
+        };
+        let approval = JournalApproval {
+            manifest_bytes: raw.as_bytes(),
+            manifest_sha256: &digest,
+            transaction_id: id,
+            client_pin: pin,
+            server_pin: pin,
+            destination_parent: parent,
+            stage_directory: stage,
+            journal_file: journal,
+            final_name: "published",
+            now_unix: 1,
+        };
+        let manifest = parse_approved_manifest(raw.as_bytes(), &digest, id, 1).unwrap();
+        let binding = JournalBinding::from_approval(&approval).unwrap();
+        let reserved = [parent, stage, journal];
+        let mut files = BTreeMap::new();
+        let mut progress = Progress::default();
+        apply(
+            &Event::Approved,
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            1,
+        )
+        .unwrap();
+        let observation = FileObservation {
+            id: "one".into(),
+            object: ObjectIdentity {
+                volume_serial: 1,
+                file_index: 4,
+            },
+            sha256: hash,
+            size: 5,
+        };
+        apply(
+            &Event::FileVerified(observation),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            2,
+        )
+        .unwrap();
+        apply(
+            &Event::CommitIntent(stage),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            3,
+        )
+        .unwrap();
+        let receipt = expected_receipt(&manifest, &binding).unwrap();
+        let _premature = apply(
+            &Event::ReceiptRecorded(receipt.clone()),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            4,
+        )
+        .unwrap_err();
+        let _wrong = apply(
+            &Event::Published(parent),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            4,
+        )
+        .unwrap_err();
+        apply(
+            &Event::Published(stage),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            4,
+        )
+        .unwrap();
+        let _forged = apply(
+            &Event::ReceiptRecorded("forged".into()),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            5,
+        )
+        .unwrap_err();
+        apply(
+            &Event::ReceiptRecorded(receipt.clone()),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            5,
+        )
+        .unwrap();
+        let _duplicate = apply(
+            &Event::ReceiptRecorded(receipt.clone()),
+            &manifest,
+            &binding,
+            &reserved,
+            &mut files,
+            &mut progress,
+            6,
+        )
+        .unwrap_err();
+        assert_eq!(progress.receipt.as_deref(), Some(receipt.as_str()));
+        assert!(receipt.contains("published-durability-unconfirmed"));
+        assert_eq!(receipt, expected_receipt(&manifest, &binding).unwrap());
     }
 }

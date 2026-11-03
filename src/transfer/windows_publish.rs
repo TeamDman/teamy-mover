@@ -5,9 +5,11 @@
 //! boundaries, filesystem semantics and recovery before any live use.
 
 use super::blocking_io::BlockingIoGate;
+use super::journal::{JournalBinding, ObjectIdentity};
 use super::manifest::valid_component;
 use super::transaction_journal::TransactionJournal;
-use super::windows_acl::CreatedDirectory;
+use super::windows_acl::{CreatedDirectory, open_checked_child};
+use super::windows_lock::directory_identity;
 use eyre::{Result, ensure};
 use std::fs::File;
 use std::os::windows::io::AsRawHandle;
@@ -23,22 +25,75 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 #[derive(Debug)]
 pub struct PublicationPermit(BlockingIoGate);
 
-/// An observed rename outcome, never a durability or receipt guarantee.
+/// An observed rename outcome, never a power-loss durability guarantee.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RenameOutcome {
-    /// Windows reported success; directory and journal durability remain unconfirmed.
+    /// Windows reported success and an unconfirmed-durability receipt was persisted.
     RenamedDurabilityUnconfirmed,
+    /// The rename succeeded, but observation or journal persistence failed.
+    RenamedRecordUnconfirmed,
     /// Preserve the objects and reconcile locally; do not retry or issue a receipt.
     Unconfirmed { status: u32 },
 }
 
-/// Handles retained after a completed attempt. No receipt is implied.
+/// Handles retained after a completed attempt. Receipts are not served here.
 #[derive(Debug)]
 pub struct RenameResult {
     pub outcome: RenameOutcome,
     pub journal: TransactionJournal,
     pub stage: CreatedDirectory,
     pub destination_parent: File,
+}
+
+/// Evidence produced only inside this module after the kernel reports success
+/// and the approved final name resolves to the same retained stage identity.
+pub(crate) struct ObservedPublication {
+    parent: ObjectIdentity,
+    stage: ObjectIdentity,
+    journal: ObjectIdentity,
+    final_name: String,
+}
+
+impl ObservedPublication {
+    pub(crate) fn matches(
+        self,
+        parent: ObjectIdentity,
+        stage: ObjectIdentity,
+        journal: ObjectIdentity,
+        binding: &JournalBinding,
+    ) -> bool {
+        self.parent == parent
+            && self.stage == stage
+            && self.journal == journal
+            && binding.matches_publication_target(parent, &self.final_name)
+    }
+}
+
+fn observed_publication(
+    journal: &TransactionJournal,
+    stage: &CreatedDirectory,
+    parent: &File,
+    name: &str,
+) -> Result<ObservedPublication> {
+    let parent_id = directory_identity(parent)?;
+    let stage_id = directory_identity(stage)?;
+    let published = open_checked_child(parent, parent_id, name, false)?;
+    ensure!(
+        directory_identity(&published)? == stage_id,
+        "published identity does not match stage"
+    );
+    Ok(ObservedPublication {
+        parent: ObjectIdentity {
+            volume_serial: parent_id.volume_serial,
+            file_index: parent_id.file_index,
+        },
+        stage: ObjectIdentity {
+            volume_serial: stage_id.volume_serial,
+            file_index: stage_id.file_index,
+        },
+        journal: journal.approved_journal_identity(),
+        final_name: name.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -156,7 +211,7 @@ where
                 &worker_gate,
             )?;
             after_issue();
-            let outcome = match native {
+            let mut outcome = match native {
                 NativeResult::Complete(outcome) => outcome,
                 NativeResult::Pending(buffer, io_status) => {
                     // Unexpected for a synchronous handle. Keep the I/O buffers,
@@ -173,6 +228,18 @@ where
             // worker retains every owned handle until it returns and cannot report
             // a success or receipt through a poisoned gate.
             worker_gate.ensure_active()?;
+            if outcome == RenameOutcome::RenamedDurabilityUnconfirmed {
+                let recorded =
+                    observed_publication(&journal, &stage, &destination_parent, &final_name)
+                        .and_then(|evidence| {
+                            journal.record_observed_publication(evidence, &worker_gate)
+                        });
+                if recorded.is_err() {
+                    journal.mark_publication_uncertain();
+                    outcome = RenameOutcome::RenamedRecordUnconfirmed;
+                }
+            }
+            worker_gate.ensure_active()?;
             Ok(RenameResult {
                 outcome,
                 journal,
@@ -186,7 +253,8 @@ where
 /// Attempt a single no-replace rename, moving the journal, lock, stage and
 /// parent into the blocking worker. Timeout or cancellation poisons the gate;
 /// the worker retains the objects until the kernel operation finishes.
-/// No live permit constructor exists and no receipt is generated here.
+/// No live permit constructor exists. A successful result persists but does
+/// not serve a deterministic receipt or claim power-loss durability.
 ///
 /// # Errors
 /// Rejects invalid bindings, expiry, uncertain I/O, timeouts, or a busy gate.
