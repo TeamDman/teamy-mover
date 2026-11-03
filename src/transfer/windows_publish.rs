@@ -43,6 +43,9 @@ pub struct RenameResult {
     pub journal: TransactionJournal,
     pub stage: CreatedDirectory,
     pub destination_parent: File,
+    /// Caller-supplied ancestry retained throughout the rename. Their presence
+    /// alone is not evidence that the chain was qualified or remained named.
+    pub ancestry: Vec<File>,
 }
 
 /// Evidence produced only inside this module after the kernel reports success
@@ -183,11 +186,16 @@ fn issue_rename(
     }
 }
 
+struct RetainedDestination {
+    parent: File,
+    ancestry: Vec<File>,
+}
+
 async fn run_owned<F>(
     permit: PublicationPermit,
     mut journal: TransactionJournal,
     mut stage: CreatedDirectory,
-    destination_parent: File,
+    destination: RetainedDestination,
     final_name: String,
     deadline: Duration,
     after_issue: F,
@@ -199,6 +207,10 @@ where
         !deadline.is_zero() && deadline <= Duration::from_secs(30),
         "invalid rename deadline"
     );
+    ensure!(
+        destination.ancestry.len() <= 64,
+        "too many retained ancestor handles"
+    );
     let worker_gate = permit.0.clone();
     permit
         .0
@@ -206,18 +218,20 @@ where
             let native = issue_rename(
                 &mut journal,
                 &mut stage,
-                &destination_parent,
+                &destination.parent,
                 &final_name,
                 &worker_gate,
             )?;
-            after_issue();
             let mut outcome = match native {
-                NativeResult::Complete(outcome) => outcome,
+                NativeResult::Complete(outcome) => {
+                    after_issue();
+                    outcome
+                }
                 NativeResult::Pending(buffer, io_status) => {
                     // Unexpected for a synchronous handle. Keep the I/O buffers,
                     // stage, parent, journal and exclusive lock alive until process
                     // termination; a consumed single-use permit bounds this attempt.
-                    quarantine_pending((buffer, io_status, journal, stage, destination_parent));
+                    quarantine_pending((buffer, io_status, journal, stage, destination));
                     eyre::bail!("pending rename quarantined; inspect after process exit");
                 }
             };
@@ -230,7 +244,7 @@ where
             worker_gate.ensure_active()?;
             if outcome == RenameOutcome::RenamedDurabilityUnconfirmed {
                 let recorded =
-                    observed_publication(&journal, &stage, &destination_parent, &final_name)
+                    observed_publication(&journal, &stage, &destination.parent, &final_name)
                         .and_then(|evidence| {
                             journal.record_observed_publication(evidence, &worker_gate)
                         });
@@ -244,7 +258,8 @@ where
                 outcome,
                 journal,
                 stage,
-                destination_parent,
+                destination_parent: destination.parent,
+                ancestry: destination.ancestry,
             })
         })
         .await
@@ -270,7 +285,43 @@ pub async fn rename_with_permit(
         permit,
         journal,
         stage,
-        destination_parent,
+        RetainedDestination {
+            parent: destination_parent,
+            ancestry: Vec::new(),
+        },
+        final_name,
+        deadline,
+        || {},
+    )
+    .await
+}
+
+/// Like [`rename_with_permit`], retaining caller-qualified ancestry through
+/// completion or quarantine. This does not validate or qualify those handles.
+/// There is no operational permit constructor; the future qualification gate
+/// must prove that the supplied chain is complete, valid and protected.
+///
+/// # Errors
+/// Rejects an empty or overlong ancestry, invalid bindings, expired approval,
+/// uncertain I/O, timeouts, or a busy gate.
+pub async fn rename_with_permit_and_ancestry(
+    permit: PublicationPermit,
+    journal: TransactionJournal,
+    stage: CreatedDirectory,
+    destination_parent: File,
+    ancestry: Vec<File>,
+    final_name: String,
+    deadline: Duration,
+) -> Result<RenameResult> {
+    ensure!(!ancestry.is_empty(), "qualified ancestry is required");
+    run_owned(
+        permit,
+        journal,
+        stage,
+        RetainedDestination {
+            parent: destination_parent,
+            ancestry,
+        },
         final_name,
         deadline,
         || {},
@@ -283,7 +334,7 @@ pub(crate) async fn synthetic_delayed_rename<F>(
     gate: BlockingIoGate,
     journal: TransactionJournal,
     stage: CreatedDirectory,
-    parent: File,
+    parent_and_ancestry: (File, Vec<File>),
     deadline: Duration,
     after_issue: F,
 ) -> Result<RenameResult>
@@ -294,7 +345,10 @@ where
         PublicationPermit(gate),
         journal,
         stage,
-        parent,
+        RetainedDestination {
+            parent: parent_and_ancestry.0,
+            ancestry: parent_and_ancestry.1,
+        },
         "published".to_owned(),
         deadline,
         after_issue,
@@ -336,6 +390,7 @@ mod tests {
         };
         let base = std::path::PathBuf::from(base);
         let journal = exclusive_file(&base.join("journal.bin")).unwrap();
+        let ancestor = exclusive_file(&base.join("ancestor.bin")).unwrap();
         let stage = exclusive_directory(&base.join("stage")).unwrap();
         let parent = exclusive_directory(&base).unwrap();
         // Exercise the exact quarantine helper with synthetic I/O buffers and
@@ -344,6 +399,7 @@ mod tests {
             journal,
             stage,
             parent,
+            vec![ancestor],
             vec![0_u64; 8],
             Box::new(IO_STATUS_BLOCK::default()),
         ));
@@ -358,6 +414,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::create_dir(fixture.path().join("stage")).unwrap();
         std::fs::write(fixture.path().join("journal.bin"), b"synthetic").unwrap();
+        std::fs::write(fixture.path().join("ancestor.bin"), b"synthetic").unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -389,12 +446,14 @@ mod tests {
             panic!("synthetic quarantine child did not become ready");
         }
         let _journal_blocked = exclusive_file(&fixture.path().join("journal.bin")).unwrap_err();
+        let _ancestor_blocked = exclusive_file(&fixture.path().join("ancestor.bin")).unwrap_err();
         let _stage_blocked = exclusive_directory(&fixture.path().join("stage")).unwrap_err();
         let _parent_blocked = exclusive_directory(fixture.path()).unwrap_err();
         child.stdin.take().unwrap().write_all(b"x").unwrap();
         assert!(child.wait().unwrap().success());
         reader.join().unwrap();
         exclusive_file(&fixture.path().join("journal.bin")).unwrap();
+        exclusive_file(&fixture.path().join("ancestor.bin")).unwrap();
         exclusive_directory(&fixture.path().join("stage")).unwrap();
         exclusive_directory(fixture.path()).unwrap();
     }

@@ -771,6 +771,92 @@ impl TransactionJournal {
         self.persist(Event::CommitIntent(self.reserved[1]), now)
     }
 
+    /// Recheck a held staged file set and persist commit intent under a running
+    /// single-flight blocking-I/O gate. This is not a publication permit: the
+    /// caller must separately qualify and retain trusted ancestry, stage and
+    /// destination handles, access controls and filesystem semantics.
+    ///
+    /// The worker must own the journal, stage and file handles until it exits.
+    /// A timeout or cancellation can occur during an OS call or journal sync;
+    /// treat the outcome as uncertain and require local inspection, never a
+    /// concurrent retry. Child handles remain held on success.
+    ///
+    /// # Errors
+    /// Rejects expired approval, unsafe or mismatched stage/files, unexpected
+    /// entries, changed contents, deadline expiry and journal failures.
+    pub fn prepare_staged_commit_before(
+        &mut self,
+        stage: &File,
+        files: &mut BTreeMap<String, ExclusiveFile>,
+        deadline: std::time::Instant,
+        gate: &BlockingIoGate,
+    ) -> Result<()> {
+        use super::windows_lock::FileIdentity;
+        use super::windows_stage::{ExpectedEntry, verify_entries};
+
+        let expiry = self.manifest.expires_unix();
+        let checkpoint = || -> Result<u64> {
+            gate.ensure_active()?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "commit preparation deadline expired"
+            );
+            let current = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            ensure!(current < expiry, "approval expired");
+            Ok(current)
+        };
+        checkpoint()?;
+        self.lock.verify()?;
+        let stage_id = directory_identity(stage)?;
+        ensure!(
+            stage_id
+                == FileIdentity {
+                    volume_serial: self.reserved[1].volume_serial,
+                    file_index: self.reserved[1].file_index,
+                },
+            "stage identity mismatch"
+        );
+        ensure!(
+            files.len() == self.manifest.files().len(),
+            "file set mismatch"
+        );
+        let approved: Vec<_> = self
+            .manifest
+            .files()
+            .map(|item| (item.id().to_owned(), item.name().to_owned(), item.size()))
+            .collect();
+        let mut entries = Vec::with_capacity(approved.len());
+        for (id, name, size) in &approved {
+            ensure!(self.has_observation(id), "file observation missing");
+            let file = files
+                .get(id)
+                .ok_or_else(|| eyre::eyre!("missing staged file"))?;
+            file.verify()?;
+            entries.push(ExpectedEntry {
+                name,
+                identity: file.identity(),
+                size: *size,
+            });
+        }
+        verify_entries(stage, stage_id, &entries)?;
+        checkpoint()?;
+        for (id, _, _) in &approved {
+            let file = files
+                .get_mut(id)
+                .ok_or_else(|| eyre::eyre!("missing staged file"))?;
+            file.verify()?;
+            self.verify_file_before(id, file.file_mut(), deadline, gate)?;
+            file.verify()?;
+        }
+        verify_entries(stage, stage_id, &entries)?;
+        let current = checkpoint()?;
+        self.record_commit_intent(current)?;
+        checkpoint()?;
+        Ok(())
+    }
+
     /// The journaled pre-rename identity, if commit intent was recorded.
     /// This is not evidence that a rename took place.
     #[must_use]

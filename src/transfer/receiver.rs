@@ -777,43 +777,48 @@ mod tests {
 
     #[tokio::test]
     async fn protected_three_file_staging_reaches_journal_intent_without_publication() {
-        protected_three_file_simulation(false, false, None).await;
+        protected_three_file_simulation(false, false, None, false).await;
+    }
+
+    #[tokio::test]
+    async fn protected_precommit_rejects_unexpected_stage_entry() {
+        protected_three_file_simulation(false, false, None, true).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS rename and journal-reopen probe; not a durability or staging qualification"]
     async fn protected_three_file_rename_and_reopen_recovery() {
-        protected_three_file_simulation(true, false, None).await;
+        protected_three_file_simulation(true, false, None, false).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS no-replace collision probe; not a staging qualification"]
     async fn protected_three_file_rename_preserves_existing_destination() {
-        protected_three_file_simulation(true, true, None).await;
+        protected_three_file_simulation(true, true, None, false).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS timeout after synthetic rename; not crash or durability proof"]
     async fn protected_rename_timeout_keeps_resources_until_worker_finishes() {
-        protected_three_file_simulation(true, false, Some((false, false))).await;
+        protected_three_file_simulation(true, false, Some((false, false)), false).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS cancellation after synthetic rename; not crash or durability proof"]
     async fn protected_rename_cancellation_keeps_resources_until_worker_finishes() {
-        protected_three_file_simulation(true, false, Some((true, false))).await;
+        protected_three_file_simulation(true, false, Some((true, false)), false).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS timeout after published record; not crash or durability proof"]
     async fn timeout_after_published_record_does_not_issue_receipt() {
-        protected_three_file_simulation(true, false, Some((false, true))).await;
+        protected_three_file_simulation(true, false, Some((false, true)), false).await;
     }
 
     #[tokio::test]
     async fn synthetic_crash_child() {
         if std::env::var_os("TEAMY_TEST_CRASH_ROOT").is_some() {
-            protected_three_file_simulation(true, false, None).await;
+            protected_three_file_simulation(true, false, None, false).await;
             panic!("synthetic crash hook did not terminate the child");
         }
     }
@@ -960,6 +965,7 @@ mod tests {
         attempt_rename: bool,
         collision: bool,
         interrupted: Option<(bool, bool)>,
+        unexpected_entry: bool,
     ) {
         use crate::transfer::recovery::RecoveryDisposition;
         use crate::transfer::transaction_journal::LocalInspection;
@@ -969,7 +975,8 @@ mod tests {
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            RenameOutcome, rename_with_permit, synthetic_delayed_rename, synthetic_permit,
+            RenameOutcome, rename_with_permit_and_ancestry, synthetic_delayed_rename,
+            synthetic_permit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1064,10 +1071,37 @@ mod tests {
                 assert_eq!(actual, expected);
             }
             verify_entries(&stage, stage_id, &entries).unwrap();
-            // Test the existing journal primitive only; no publication permit
-            // or recovery guarantee follows from these synthetic checks.
+            if unexpected_entry {
+                drop(create_private_file(&stage, stage_id, "unexpected.bin").unwrap());
+            }
+            // Move all open stage resources into the deadline-bound worker.
+            // This is still a synthetic setup, not a staging/publication permit.
+            let (budget, deadline) = worker_budget(&receiver_state).unwrap();
+            let gate = receiver_state.io_gate.clone();
+            let worker_gate = gate.clone();
+            let mut journal = receiver_state.journal.take().unwrap();
+            let mut files = std::mem::take(&mut receiver_state.files);
+            let prepared = gate.run(budget, move || {
+                journal.prepare_staged_commit_before(&stage, &mut files, deadline, &worker_gate)?;
+                Ok((journal, files, stage))
+            }).await;
+            if unexpected_entry {
+                assert!(prepared.is_err());
+                drop(receiver_state);
+                let lock = ExclusiveFile::acquire(&dir.path().join("private/journal.bin"), journal_id).unwrap();
+                let reopened = TransactionJournal::reopen(lock, &approval).unwrap();
+                assert!(reopened.commit_intent_stage().is_none());
+                assert!(dir.path().join("private/stage/unexpected.bin").exists());
+                assert!(!dir.path().join("private/published").exists());
+                for (id, body) in ids.iter().zip(bodies) {
+                    assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                }
+                return;
+            }
+            let (journal, files, stage) = prepared.unwrap();
+            receiver_state.journal = Some(journal);
+            receiver_state.files = files;
             let journal = receiver_state.journal.as_mut().unwrap();
-            journal.record_commit_intent(now().unwrap()).unwrap();
             assert!(journal.intent_matches_directory(&stage).unwrap());
             assert!(journal.commit().is_err());
             if attempt_rename {
@@ -1082,14 +1116,19 @@ mod tests {
                     use std::os::windows::fs::OpenOptionsExt;
                     use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
                     let gate = BlockingIoGate::default();
+                    // This locked temporary file stands in for a held ancestor;
+                    // it tests worker ownership, not ancestry qualification.
+                    let ancestry_path = dir.path().join("synthetic-ancestry-handle");
+                    let ancestry = std::fs::OpenOptions::new().read(true).write(true)
+                        .create_new(true).share_mode(0).open(&ancestry_path).unwrap();
                     let (release, wait) = std::sync::mpsc::channel::<()>();
                     let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
                     let pause = move || { let _sent = started.send(()); let _released = wait.recv(); };
                     let task = if after_published {
                         journal.set_before_receipt(Box::new(pause));
-                        tokio::spawn(synthetic_delayed_rename(gate.clone(), journal, stage, parent, Duration::from_millis(500), || {}))
+                        tokio::spawn(synthetic_delayed_rename(gate.clone(), journal, stage, (parent, vec![ancestry]), Duration::from_millis(500), || {}))
                     } else {
-                        tokio::spawn(synthetic_delayed_rename(gate.clone(), journal, stage, parent, Duration::from_millis(500), pause))
+                        tokio::spawn(synthetic_delayed_rename(gate.clone(), journal, stage, (parent, vec![ancestry]), Duration::from_millis(500), pause))
                     };
                     tokio::time::timeout(Duration::from_secs(3), started_rx).await.unwrap().unwrap();
                     if cancel {
@@ -1100,6 +1139,7 @@ mod tests {
                     }
                     let journal_path = dir.path().join("private/journal.bin");
                     let _held = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                    let _held_ancestor = std::fs::OpenOptions::new().write(true).open(&ancestry_path).unwrap_err();
                     assert!(dir.path().join("private/published").is_dir());
                     assert!(gate.run(Duration::from_secs(1), || Ok(())).await.is_err());
                     release.send(()).unwrap();
@@ -1109,6 +1149,7 @@ mod tests {
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     }).await.expect("rename worker did not release resources");
+                    let _released_ancestor = std::fs::OpenOptions::new().write(true).open(&ancestry_path).unwrap();
                     assert!(gate.run(Duration::from_secs(1), || Ok(())).await.is_err());
                     let mut recovered = TransactionJournal::reopen(lock, &approval).unwrap();
                     assert!(recovered.recorded_receipt().is_none());
@@ -1136,7 +1177,9 @@ mod tests {
                     let mut marker = create_private_file(&existing, existing_id, "existing.bin").unwrap();
                     marker.file_mut().write_all(b"already here").unwrap();
                     drop(marker);
-                    let result = rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap();
+                    let ancestor = parent.try_clone().unwrap();
+                    let result = rename_with_permit_and_ancestry(synthetic_permit(), journal, stage, parent, vec![ancestor], "published".to_owned(), Duration::from_secs(3)).await.unwrap();
+                    assert_eq!(result.ancestry.len(), 1);
                     assert!(matches!(result.outcome, RenameOutcome::Unconfirmed { .. }));
                     assert!(result.journal.recorded_receipt().is_none());
                     assert!(result.journal.intent_matches_directory(&result.stage).unwrap());
@@ -1150,9 +1193,10 @@ mod tests {
                     return;
                 }
                 let result = if crash_point.as_deref() == Some("after-rename") {
-                    synthetic_delayed_rename(BlockingIoGate::default(), journal, stage, parent, Duration::from_secs(3), || std::process::exit(78)).await.unwrap()
+                    synthetic_delayed_rename(BlockingIoGate::default(), journal, stage, (parent, Vec::new()), Duration::from_secs(3), || std::process::exit(78)).await.unwrap()
                 } else {
-                    rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap()
+                    let ancestor = parent.try_clone().unwrap();
+                    rename_with_permit_and_ancestry(synthetic_permit(), journal, stage, parent, vec![ancestor], "published".to_owned(), Duration::from_secs(3)).await.unwrap()
                 };
                 assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
                 let receipt = result.journal.recorded_receipt().unwrap().to_owned();
