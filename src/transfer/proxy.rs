@@ -7,6 +7,7 @@ use bytes::Bytes;
 use eyre::Result;
 use eyre::bail;
 use eyre::ensure;
+use http_body_util::BodyExt;
 use http_body_util::Empty;
 use hyper::Method;
 use hyper::Request;
@@ -25,6 +26,8 @@ use tokio::task::JoinHandle;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROXY_RESPONSE_BYTES: usize = 8192;
 const MAX_PROXY_HEADERS: usize = 32;
+const MAX_ERROR_BODY_BYTES: usize = 2048;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Exact IP/port and peer certificate pins supplied by local configuration.
 /// Constructing this value does not itself establish the configuration's trust,
@@ -192,13 +195,107 @@ where
         }));
         let response = sender.send_request(request).await?;
         if response.status() != StatusCode::OK {
-            bail!("CONNECT proxy returned HTTP {}", response.status().as_u16());
+            let status = response.status().as_u16();
+            let details = proxy_failure_details(response).await;
+            bail!("CONNECT proxy returned HTTP {status}{details}");
         }
         let upgraded = hyper::upgrade::on(response).await?;
         (&mut driver.0).await?;
         Ok(TokioIo::new(upgraded))
     };
     with_timeout(timeout, task).await
+}
+
+// Proxy text is untrusted and may contain credentials, internal addresses, or
+// terminal escape sequences. Never log it: report only a fixed vocabulary of
+// literal markers and a bounded numeric Retry-After. Markers are observations
+// in a proxy response, not proof of the underlying failure's cause.
+async fn proxy_failure_details(response: hyper::Response<hyper::body::Incoming>) -> String {
+    let retry = response
+        .headers()
+        .get(hyper::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 5 && value.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|seconds| *seconds <= 86_400);
+    let mut body = response.into_body();
+    let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+    let mut truncated = false;
+    let read = async {
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_error| ())?;
+            if let Some(data) = frame.data_ref() {
+                let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
+                bytes.extend_from_slice(&data[..data.len().min(remaining)]);
+                if data.len() > remaining || bytes.len() == MAX_ERROR_BODY_BYTES {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        Ok::<(), ()>(())
+    };
+    let body_state = match tokio::time::timeout(ERROR_BODY_TIMEOUT, read).await {
+        Ok(Ok(())) if truncated => "truncated",
+        Ok(Ok(())) => "complete",
+        Ok(Err(())) => "read-error",
+        Err(_) => "timed-out",
+    };
+    bytes.make_ascii_lowercase();
+    let markers = [
+        (
+            "connection-refused",
+            ["connection refused", "econnrefused"].as_slice(),
+        ),
+        (
+            "network-unreachable",
+            ["network unreachable", "enetunreach"].as_slice(),
+        ),
+        (
+            "host-unreachable",
+            ["host unreachable", "ehostunreach", "no route to host"].as_slice(),
+        ),
+        (
+            "timeout",
+            ["timed out", "etimedout", "i/o timeout"].as_slice(),
+        ),
+        (
+            "connection-reset",
+            ["connection reset", "econnreset"].as_slice(),
+        ),
+        (
+            "permission-denied",
+            ["permission denied", "access denied"].as_slice(),
+        ),
+    ];
+    let observed = markers
+        .iter()
+        .filter_map(|(name, terms)| {
+            terms
+                .iter()
+                .any(|term| {
+                    bytes
+                        .windows(term.len())
+                        .any(|window| window == term.as_bytes())
+                })
+                .then_some(*name)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut detail = format!(" (proxy body {body_state}");
+    if !observed.is_empty() {
+        detail.push_str("; reported markers: ");
+        detail.push_str(&observed);
+    }
+    if let Some(seconds) = retry {
+        detail.push_str("; retry-after: ");
+        detail.push_str(&seconds.to_string());
+        detail.push('s');
+    }
+    detail.push(')');
+    detail
 }
 
 async fn with_timeout<T>(duration: Duration, task: impl Future<Output = Result<T>>) -> Result<T> {
@@ -259,6 +356,62 @@ mod tests {
         );
         let stream = proxy_response(reply.into_bytes());
         let _error = connect(stream, "100.64.0.1:49152").await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn proxy_failure_reports_only_safe_bounded_markers() {
+        let body = "upstream: Connection refused; token=SECRET_TOKEN; host=private.example";
+        let reply = format!(
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nRetry-After: 15\r\nX-Secret: HEADER_SECRET\r\n\r\n{body}",
+            body.len()
+        );
+        let error = connect(proxy_response(reply.into_bytes()), "100.64.0.1:49152")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HTTP 503"));
+        assert!(error.contains("reported markers: connection-refused"));
+        assert!(error.contains("retry-after: 15s"));
+        assert!(!error.contains("SECRET"));
+        assert!(!error.contains("private.example"));
+
+        let body = format!("{}ECONNREFUSED", "x".repeat(MAX_ERROR_BODY_BYTES));
+        let reply = format!(
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nRetry-After: SECRET\r\n\r\n{body}",
+            body.len()
+        );
+        let error = connect(proxy_response(reply.into_bytes()), "100.64.0.1:49152")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("proxy body truncated"));
+        assert!(!error.contains("connection-refused"));
+        assert!(!error.contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn stalled_proxy_error_body_keeps_http_status_and_times_out() {
+        let (client, mut proxy) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(proxy.read_u8().await.unwrap());
+            }
+            proxy
+                .write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 100\r\n\r\naccess denied")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), connect(client, "100.64.0.1:49152"))
+                .await
+                .expect("error body read was not bounded");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("HTTP 503"));
+        assert!(error.contains("proxy body timed-out"));
+        assert!(error.contains("reported markers: permission-denied"));
+        task.abort();
     }
 
     #[tokio::test]

@@ -32,6 +32,12 @@ root, validates TLS identity and both exact leaf pins, and never deletes the
 sources. The proxy address is locally supplied and CONNECT is attempted only
 to the selected tailnet target. No alternate route is tried.
 
+For a non-200 CONNECT response, the sender reports its HTTP status, a numeric
+`Retry-After` when present, and selected fixed markers found in at most 2 KiB
+of the response body. Body inspection is limited to 250 ms. These markers are
+observations of proxy text, not proof of the failure's cause; unrecognized
+details are omitted. Arbitrary headers and response text are never printed.
+
 The sender applies the existing process limit before starting its async
 runtime. A commit failure, timeout or disconnect may leave publication
 uncertain and requires receiver-side inspection. A reported successful
