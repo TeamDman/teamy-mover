@@ -46,6 +46,7 @@ const UNTRUSTED_READ_ONLY: u32 = 0x8000_0000 | 0x2000_0000 | 0x0010_0000 | 0x000
 const ADD_SUBDIRECTORY: u32 = 0x0000_0004;
 // Inheritable create rights could also apply to protected descendants.
 const ACE_INHERITANCE_FLAGS: u8 = 0x01 | 0x02 | 0x08;
+const ACE_INHERIT_ONLY: u8 = 0x08;
 const MAX_ACES: usize = 512;
 
 struct LocalDescriptor(PSECURITY_DESCRIPTOR);
@@ -303,6 +304,19 @@ fn verify_ace(
             let valid = unsafe { IsValidSid(sid) }.as_bool();
             ensure!(valid, "invalid allow ACE SID");
             if !is_trusted_sid(sid, user) {
+                if root_sibling_create_candidate {
+                    ensure!(header.AceFlags & !0x1f == 0, "unsupported allow ACE flags");
+                }
+                if root_sibling_create_candidate && header.AceFlags & ACE_INHERIT_ONLY != 0 {
+                    ensure!(
+                        header.AceFlags & 0x03 != 0,
+                        "inherit-only ACE has no inheritance target"
+                    );
+                    // This ACE does not grant access to this root object, but
+                    // may grant rights on children. No descendant check may
+                    // use this candidate policy; every edge remains strict.
+                    return Ok(());
+                }
                 let permitted = UNTRUSTED_READ_ONLY
                     | if root_sibling_create_candidate {
                         ADD_SUBDIRECTORY
@@ -427,8 +441,11 @@ pub fn verify_directory_acl(
 /// the concrete mechanism is independently reviewed and all gates pass.
 ///
 /// # Errors
-/// Rejects all untrusted mutation grants except non-inheritable
+/// Rejects effective untrusted mutation grants except non-inheritable
 /// create-subdirectory, and rejects unsafe descriptors or directory handles.
+/// Inherit-only allow ACEs can grant rights to descendants and are ignored
+/// only for this non-authorizing root diagnostic; descendants must be checked
+/// separately using the strict filter.
 pub fn inspect_root_acl_candidate(directory: &File, user_sid: &[u8]) -> Result<()> {
     inspect_directory_acl(directory, user_sid, false, true)
 }
@@ -814,8 +831,7 @@ mod tests {
         verify_descriptor(safe.0, user, true).unwrap();
         let writable = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;FW;;;WD)");
         assert!(verify_descriptor(writable.0, user, true).is_err());
-        // The proposed root-only sibling-creation exception is not yet
-        // approved or implemented: the current filter still rejects it.
+        // The strict filter never applies the diagnostic root exception.
         let sibling_create = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)");
         assert!(verify_descriptor(sibling_create.0, user, true).is_err());
         let delete_child = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x40;;;WD)");
@@ -848,11 +864,11 @@ mod tests {
             verify_descriptor_inner(descriptor.0, user, true, true, true)
         };
         candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;;FR;;;WD)(A;;0x4;;;WD)").unwrap();
+        candidate("O:SYG:SYD:P(A;;FA;;;SY)(A;OICIIO;0xe0010000;;;AU)").unwrap();
         for unsafe_ace in [
             "(A;CI;0x4;;;WD)",
             "(A;OI;0x4;;;WD)",
-            "(A;CIIO;0x4;;;WD)",
-            "(A;OICIIO;0xe0010000;;;AU)",
+            "(A;OICI;0xe0010000;;;AU)",
             "(A;;0x6;;;WD)",
             "(A;;0x44;;;WD)",
             "(A;;GW;;;WD)",
@@ -866,6 +882,50 @@ mod tests {
         assert!(candidate("O:WDG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)").is_err());
         let strict = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;;0x4;;;WD)");
         assert!(verify_descriptor(strict.0, user, true).is_err());
+    }
+
+    #[test]
+    fn inherit_only_root_grant_can_be_effective_on_a_child() {
+        let sid = process_user_sid().unwrap();
+        let mut words = sid_storage(&sid).unwrap();
+        let mut string = windows::core::PWSTR::null();
+        // SAFETY: the SID is validated and string is a writable out pointer.
+        unsafe {
+            ConvertSidToStringSidW(PSID(words.as_mut_ptr().cast()), &raw mut string).unwrap()
+        };
+        // SAFETY: Windows returned a valid NUL-terminated SID string.
+        let user_sid = unsafe { string.to_string().unwrap() };
+        // SAFETY: the string is a Windows LocalAlloc allocation owned here.
+        let _freed = unsafe { LocalFree(Some(HLOCAL(string.0.cast()))) };
+        let security = descriptor(&format!("D:P(A;;FA;;;{user_sid})(A;OICIIO;FA;;;WD)"));
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path().join("candidate");
+        let wide: Vec<u16> = root_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
+            lpSecurityDescriptor: security.0.0,
+            bInheritHandle: windows::core::BOOL(0),
+        };
+        // SAFETY: the synthetic path and security descriptor remain live.
+        unsafe { CreateDirectoryW(PCWSTR(wide.as_ptr()), Some(&raw const attributes)).unwrap() };
+        std::fs::create_dir(root_path.join("child")).unwrap();
+        let open = |path: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .access_mode((READ_CONTROL | FILE_READ_ATTRIBUTES).0)
+                .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+                .open(path)
+                .unwrap()
+        };
+        let root = open(&root_path);
+        let child = open(&root_path.join("child"));
+        inspect_root_acl_candidate(&root, &sid).unwrap();
+        assert!(verify_directory_acl(&root, &sid, true).is_err());
+        assert!(verify_directory_acl(&child, &sid, false).is_err());
     }
 
     #[test]

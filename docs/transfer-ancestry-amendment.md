@@ -30,6 +30,27 @@ untrusted; a malicious administrator or kernel remains outside the guarantee.
 
 ## Required qualification
 
+An ordinary allow ACE marked `INHERIT_ONLY_ACE` does not control access to the
+object carrying it, but may propagate to child objects. The root ACL diagnostic
+may disregard such an ACE **for the root candidate only** after validating its
+type, structure, SID and flags. This does not authorize ignoring it for any
+child: each existing descendant needs its own strict ACL and identity checks,
+and new private objects need restrictive descriptors at creation. A protected
+child can still have unsafe access through an earlier open handle. See
+[Microsoft's ACE header documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_ace_header)
+and [inheritance description](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-azod/19165a4a-a18d-463f-8272-f758b484bf32).
+The diagnostic is not a qualification decision and must not be used as a
+publication permit.
+
+Owner classification also requires review. The candidate filter currently
+trusts only the approved user, LocalSystem and the built-in Administrators
+group. A system-managed volume root may instead be owned by the Windows
+TrustedInstaller service SID. The diagnostic must continue rejecting an owner
+outside its explicit trusted set until the exact SID's authority and inclusion
+in the approved OS trust boundary have been independently reviewed. A
+display-name match, an ACL-only result, or the presence of a system service
+account alone is not sufficient to trust it.
+
 * Anchor the intended local filesystem and volume-root identity using trusted
   local approval, not a peer-supplied path or a drive letter alone. Reject
   unverified device aliases, remote paths, volume changes, reparse points and
@@ -40,7 +61,10 @@ untrusted; a malicious administrator or kernel remains outside the guarantee.
   ownership and privileges. Fail closed on an unrecognized descriptor or an
   unprovable privilege boundary. A DACL-only allow-mask scan is not an effective
   access check and does not exclude backup, restore, take-ownership or other
-  privileged bypass by a non-administrator account.
+  privileged bypass by a non-administrator account. Checking a single token with
+  `AccessCheck` or `AuthzAccessCheck` does not establish the rights, privileges,
+  group memberships or pre-existing handles of all other users; an auditable
+  method to establish the complete threat boundary is still required.
 * For every protected edge, exclude untrusted authority over the existing child
   and its parent that could delete, rename or replace the child, change its
   owner or DACL, or alter it into or through a reparse point. Check both child
