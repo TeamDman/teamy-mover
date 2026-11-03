@@ -13,7 +13,7 @@ fn transfer_placeholders_refuse_to_run_and_do_not_create_files() {
             .unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("transfer is not yet available"));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, []);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
@@ -60,7 +60,7 @@ fn validate_manifest_checks_local_approval_without_modifying_input() {
     assert!(output.contains("\"aggregate_bytes\": 5"));
     let bad = run(&"0".repeat(64));
     assert!(!bad.status.success());
-    assert!(bad.stdout.is_empty());
+    assert_eq!(bad.stdout, []);
     assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
