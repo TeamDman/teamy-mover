@@ -15,6 +15,8 @@ use hyper::Uri;
 use hyper::client::conn::http1;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+use std::net::SocketAddr;
+use std::net::SocketAddrV4;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -23,6 +25,81 @@ use tokio::task::JoinHandle;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROXY_RESPONSE_BYTES: usize = 8192;
 const MAX_PROXY_HEADERS: usize = 32;
+
+/// Exact IP/port and peer certificate pins supplied by local configuration.
+/// Constructing this value does not itself establish the configuration's trust,
+/// authorize a transfer, or prove that a Tailscale peer owns the IP address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalDirectTarget {
+    endpoint: SocketAddrV4,
+    server_pin: [u8; 32],
+    client_pin: [u8; 32],
+}
+
+impl LocalDirectTarget {
+    /// Validate the shape of a locally approved direct target. The caller must
+    /// independently establish the authority and integrity of these inputs.
+    ///
+    /// # Errors
+    /// Rejects an address outside 100.64.0.0/10 or an unspecified port.
+    pub fn new(endpoint: SocketAddrV4, server_pin: [u8; 32], client_pin: [u8; 32]) -> Result<Self> {
+        let octets = endpoint.ip().octets();
+        ensure!(
+            octets[0] == 100 && (octets[1] & 0xc0) == 0x40 && endpoint.port() != 0,
+            "direct target must have a nonzero port and an IPv4 address in 100.64.0.0/10"
+        );
+        Ok(Self {
+            endpoint,
+            server_pin,
+            client_pin,
+        })
+    }
+
+    /// Confirm the configured TLS name and both certificate pins match this
+    /// target before performing CONNECT. This does not perform a handshake.
+    ///
+    /// # Errors
+    /// Rejects an endpoint with a different IP identity or certificate pin.
+    pub fn check_tls(&self, tls: &super::tls::ClientEndpoint) -> Result<()> {
+        ensure!(
+            tls.matches_ip_and_pins(*self.endpoint.ip(), &self.server_pin, &self.client_pin),
+            "TLS identity does not match local target"
+        );
+        Ok(())
+    }
+
+    /// Check the requested or observed listener address and server certificate
+    /// configuration against this local target. Call before bind and again on
+    /// the bound socket; neither check creates a listener or authorizes it.
+    ///
+    /// # Errors
+    /// Rejects a different address, port, server certificate, or client pin.
+    pub fn check_server(
+        &self,
+        address: SocketAddr,
+        tls: &super::tls::ServerEndpoint,
+    ) -> Result<()> {
+        ensure!(
+            address == SocketAddr::V4(self.endpoint)
+                && tls.matches_pins(&self.server_pin, &self.client_pin),
+            "receiver address or TLS identity does not match local target"
+        );
+        Ok(())
+    }
+
+    /// The exact locally configured address a future qualified receiver must
+    /// validate before and after binding. Returning it opens no socket.
+    #[must_use]
+    pub const fn bind_address(&self) -> SocketAddr {
+        SocketAddr::V4(self.endpoint)
+    }
+
+    /// Exact authority to use for the approved CONNECT request.
+    #[must_use]
+    pub fn authority(&self) -> String {
+        self.endpoint.to_string()
+    }
+}
 
 struct AbortDriver(JoinHandle<()>);
 

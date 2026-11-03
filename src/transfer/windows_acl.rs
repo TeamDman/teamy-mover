@@ -1143,6 +1143,20 @@ mod tests {
     }
 
     #[test]
+    fn strict_filter_rejects_modify_even_without_delete_child() {
+        // Synthetic descriptor: the common Windows Modify mask includes DELETE
+        // on this directory, but does not include FILE_DELETE_CHILD (0x40).
+        let modify_mask = std::hint::black_box(0x0013_01bf_u32);
+        assert_eq!(modify_mask & 0x40, 0);
+        assert_ne!(modify_mask & 0x1_0000, 0);
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut words = sid_storage(&system_sid).unwrap();
+        let user = PSID(words.as_mut_ptr().cast());
+        let modify = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;OICI;0x001301bf;;;WD)");
+        assert!(verify_descriptor(modify.0, user, true).is_err());
+    }
+
+    #[test]
     fn root_acl_candidate_allows_only_noninheritable_sibling_creation() {
         let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
         let mut words = sid_storage(&system_sid).unwrap();

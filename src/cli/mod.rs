@@ -43,6 +43,17 @@ impl PartialEq for Cli {
 }
 
 impl Cli {
+    pub(crate) fn invoke_early(&self) -> eyre::Result<Option<CliOutput>> {
+        match &self.command {
+            Command::Transfer(transfer) => match &transfer.command {
+                transfer::TransferCommand::Send(args) => args.invoke_early(),
+                transfer::TransferCommand::Receive(args) => args.invoke_early(),
+                transfer::TransferCommand::ValidateManifest(_) => Ok(None),
+            },
+            Command::Plan(_) => Ok(None),
+        }
+    }
+
     /// # Errors
     ///
     /// This function will return an error if the tokio runtime cannot be built or if the command fails.

@@ -471,10 +471,49 @@ where
     .map_err(|_error| eyre::eyre!("transfer timed out; publication may require inspection"))?
 }
 
+/// Send using the exact target and server identity from local configuration.
+/// This is a command-integration building block, not an operational command or
+/// proof that the supplied target, credentials, or proxy stream were approved.
+/// The caller must verify their provenance and satisfy every process, receiver,
+/// staging, destination, and publication gate before supplying the stream.
+/// No fallback route or source deletion is attempted.
+///
+/// # Errors
+/// Rejects mismatched TLS identity, invalid or expired manifest, CONNECT denial,
+/// failed transfer or an uncertain commit outcome.
+pub async fn send_approved_and_commit_via_local_target<S>(
+    proxy_stream: S,
+    target: &super::proxy::LocalDirectTarget,
+    tls: &super::tls::ClientEndpoint,
+    manifest_bytes: &[u8],
+    manifest_sha256: &str,
+    transaction_id: &str,
+    sources: Vec<Source>,
+) -> Result<TransferState>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    target.check_tls(tls)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let _manifest = parse_approved_manifest(manifest_bytes, manifest_sha256, transaction_id, now)?;
+    let authority = target.authority();
+    send_approved_and_commit_via_proxy(
+        proxy_stream,
+        &authority,
+        tls,
+        manifest_bytes,
+        manifest_sha256,
+        transaction_id,
+        sources,
+    )
+    .await
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use sha2::Digest;
+    use sha2::Sha256;
 
     #[tokio::test]
     async fn local_source_verification_checks_three_files_without_modifying_them() {

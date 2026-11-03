@@ -19,6 +19,8 @@ use vox::ConnectionResourceLimits;
 use vox::ConnectionSettings;
 use vox::FromVoxLane;
 use vox::LaneAcceptor;
+use vox::Link;
+use vox::LinkTx;
 use vox::Parity;
 use vox::transport::tcp::StreamLink;
 
@@ -51,14 +53,53 @@ fn limits() -> ConnectionResourceLimits {
     }
 }
 
-fn link<S>(stream: S) -> StreamLink<ReadHalf<S>, WriteHalf<S>>
+// This restricts the frame passed to StreamLink's outbound queue. It runs
+// after Vox has encoded the message and after any earlier connection queues;
+// it is not a whole-process or pre-encoding allocation bound.
+struct BoundedLink<L>(L);
+
+struct BoundedLinkTx<T>(T);
+
+impl<L: Link> Link for BoundedLink<L> {
+    type Tx = BoundedLinkTx<L::Tx>;
+    type Rx = L::Rx;
+
+    fn split(self) -> (Self::Tx, Self::Rx) {
+        let (tx, rx) = self.0.split();
+        (BoundedLinkTx(tx), rx)
+    }
+}
+
+impl<T: LinkTx> LinkTx for BoundedLinkTx<T> {
+    async fn send(&self, bytes: Vec<u8>) -> std::io::Result<()> {
+        if bytes.len() > MAX_FRAME_BYTES as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "outgoing Vox frame exceeds local limit",
+            ));
+        }
+        self.0.send(bytes).await
+    }
+
+    async fn close(self) -> std::io::Result<()> {
+        self.0.close().await
+    }
+
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+fn link<S>(stream: S) -> BoundedLink<StreamLink<ReadHalf<S>, WriteHalf<S>>>
 where
     S: AsyncRead + AsyncWrite,
 {
     let (reader, writer) = tokio::io::split(stream);
-    StreamLink::new(reader, writer)
-        .max_receive_frame_bytes(MAX_FRAME_BYTES)
-        .receive_queue_capacity(NonZeroUsize::MIN)
+    BoundedLink(
+        StreamLink::new(reader, writer)
+            .max_receive_frame_bytes(MAX_FRAME_BYTES)
+            .receive_queue_capacity(NonZeroUsize::MIN),
+    )
 }
 
 async fn initiate<S>(stream: S) -> Result<BoundedConnection>
@@ -174,7 +215,6 @@ impl BoundedConnection {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
-    use vox::Link;
     use vox::LinkRx;
 
     #[vox::service]
@@ -338,5 +378,24 @@ mod tests {
             .err()
             .expect("oversized frame must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn outbound_limit_rejects_oversize_and_accepts_boundary() {
+        let (left, right) = tokio::io::duplex(2 * MAX_FRAME_BYTES as usize);
+        let (sender, _left_rx) = link(left).split();
+        let (_right_tx, mut receiver) = link(right).split();
+
+        let error = sender
+            .send(vec![0; MAX_FRAME_BYTES as usize + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let expected = vec![0x5a; MAX_FRAME_BYTES as usize];
+        let (sent, frame_result) = tokio::join!(sender.send(expected.clone()), receiver.recv());
+        sent.unwrap();
+        let frame = frame_result.unwrap().expect("frame must arrive");
+        assert_eq!(frame.as_bytes(), expected.as_slice());
     }
 }

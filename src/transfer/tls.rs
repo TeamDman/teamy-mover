@@ -34,6 +34,7 @@ pub struct ClientEndpoint {
     config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
     server_pin: [u8; 32],
+    client_pin: [u8; 32],
 }
 
 /// TLS server configuration bound to an approved client certificate pin.
@@ -41,7 +42,6 @@ pub struct ClientEndpoint {
 pub struct ServerEndpoint {
     config: Arc<ServerConfig>,
     client_pin: [u8; 32],
-    #[cfg(windows)]
     server_pin: [u8; 32],
 }
 
@@ -145,6 +145,17 @@ fn verify_leaf(certificates: Option<&[CertificateDer<'_>]>, expected: &[u8; 32])
 }
 
 impl ClientEndpoint {
+    pub(crate) fn matches_ip_and_pins(
+        &self,
+        ip: std::net::Ipv4Addr,
+        server_pin: &[u8; 32],
+        client_pin: &[u8; 32],
+    ) -> bool {
+        self.server_name == ServerName::from(std::net::IpAddr::V4(ip))
+            && self.server_pin == *server_pin
+            && self.client_pin == *client_pin
+    }
+
     /// Construct a client using only locally configured trust and identity.
     /// The server name must be the approved DNS name or IP address.
     ///
@@ -157,6 +168,13 @@ impl ClientEndpoint {
         server_name: ServerName<'static>,
         server_pin: [u8; 32],
     ) -> Result<Self> {
+        let client_pin = Sha256::digest(
+            client_chain
+                .first()
+                .ok_or_else(|| eyre::eyre!("missing client certificate"))?
+                .as_ref(),
+        )
+        .into();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
@@ -168,6 +186,7 @@ impl ClientEndpoint {
             config: Arc::new(config),
             server_name,
             server_pin,
+            client_pin,
         })
     }
 
@@ -191,6 +210,10 @@ impl ClientEndpoint {
 }
 
 impl ServerEndpoint {
+    pub(crate) fn matches_pins(&self, server_pin: &[u8; 32], client_pin: &[u8; 32]) -> bool {
+        self.server_pin == *server_pin && self.client_pin == *client_pin
+    }
+
     /// Construct a server requiring a normally verified client certificate.
     ///
     /// # Errors
@@ -201,7 +224,6 @@ impl ServerEndpoint {
         server_key: PrivateKeyDer<'static>,
         client_pin: [u8; 32],
     ) -> Result<Self> {
-        #[cfg(windows)]
         let server_pin = {
             let leaf = server_chain
                 .first()
@@ -224,7 +246,6 @@ impl ServerEndpoint {
         Ok(Self {
             config: Arc::new(config),
             client_pin,
-            #[cfg(windows)]
             server_pin,
         })
     }

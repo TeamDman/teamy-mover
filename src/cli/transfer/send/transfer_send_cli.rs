@@ -9,6 +9,9 @@ pub struct TransferSendArgs {
     /// Verify source files only; never open a connection or send data.
     #[facet(args::named, default)]
     pub verify_only: bool,
+    /// Check the Linux sender's process limit before starting any async runtime.
+    #[facet(args::named, default)]
+    pub check_process_limit: bool,
     /// Absolute path to the canonical approved manifest.
     #[facet(args::named)]
     pub manifest_file: Option<String>,
@@ -47,12 +50,60 @@ struct VerificationSummary {
     verified: bool,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Facet)]
+struct ProcessLimitSummary {
+    address_space_bytes: u64,
+    transfer_started: bool,
+}
+
 impl TransferSendArgs {
+    /// Handle the explicit limit check before cancellation workers, logging,
+    /// credentials or the asynchronous runtime are started. This is a
+    /// diagnostic only and does not authorize or perform a transfer.
+    pub(crate) fn invoke_early(&self) -> eyre::Result<Option<crate::cli::output::CliOutput>> {
+        if !self.check_process_limit {
+            return Ok(None);
+        }
+        eyre::ensure!(
+            !self.verify_only
+                && self.manifest_file.is_none()
+                && self.manifest_sha256.is_none()
+                && self.transaction_id.is_none()
+                && self.source_map.is_none(),
+            "process-limit check cannot be combined with transfer or source inputs"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::process::Resource;
+            use rustix::process::getrlimit;
+            crate::transfer::process_limit::apply_linux_address_space_limit()?;
+            let address_space_bytes = getrlimit(Resource::As)
+                .current
+                .ok_or_else(|| eyre::eyre!("process limit is unavailable"))?;
+            Ok(Some(crate::cli::output::CliOutput::facet(
+                ProcessLimitSummary {
+                    address_space_bytes,
+                    transfer_started: false,
+                },
+                None,
+            )))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(eyre::eyre!("sender process-limit check requires Linux"))
+        }
+    }
+
     /// Verify locally approved sources only. The operational sender is gated.
     ///
     /// # Errors
     /// Rejects missing approval, unsafe input, mismatched sources or timeouts.
     pub async fn invoke(self) -> eyre::Result<crate::cli::output::CliOutput> {
+        eyre::ensure!(
+            !self.check_process_limit,
+            "process-limit check must run before the asynchronous runtime"
+        );
         if !self.verify_only {
             return Err(eyre::eyre!("transfer is not yet available"));
         }
@@ -71,12 +122,15 @@ impl TransferSendArgs {
 
     #[cfg(target_os = "linux")]
     async fn verify_linux(self) -> eyre::Result<crate::cli::output::CliOutput> {
-        use crate::transfer::manifest::{MAX_MANIFEST_BYTES, parse_approved_manifest};
-        use crate::transfer::sender::{Source, verify_approved_sources};
+        use crate::transfer::manifest::MAX_MANIFEST_BYTES;
+        use crate::transfer::manifest::parse_approved_manifest;
+        use crate::transfer::sender::Source;
+        use crate::transfer::sender::verify_approved_sources;
         use eyre::ensure;
         use std::collections::BTreeSet;
         use std::io::Read;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
 
         fn read_bounded(path: &str, limit: usize) -> eyre::Result<Vec<u8>> {
             let file = crate::transfer::source::open_linux(std::path::Path::new(path))?;

@@ -50,8 +50,6 @@ fn version() -> String {
 pub fn main() -> eyre::Result<()> {
     // Install color_eyre for better error reports
     color_eyre::install()?;
-    let cancellation_token = CtrlCHandler::default().install()?;
-
     #[cfg(windows)]
     {
         // Enable ANSI support on Windows
@@ -96,6 +94,11 @@ pub fn main() -> eyre::Result<()> {
         Err(error) if !error.is_success() => return Err(eyre::eyre!("{error}")),
         Err(error) => figue::DriverOutcome::err(error).unwrap(),
     };
+
+    if let Some(output) = cli.invoke_early()? {
+        return output.emit(cli.global_args.output_format);
+    }
+    let cancellation_token = CtrlCHandler::default().install()?;
 
     let _stop_after_duration_thread = cli
         .global_args

@@ -12,6 +12,7 @@ use rustls::pki_types::ServerName;
 use sha2::Digest;
 use sha2::Sha256;
 use teamy_mover::transfer::manifest::parse_approved_manifest;
+use teamy_mover::transfer::proxy::LocalDirectTarget;
 use teamy_mover::transfer::session::BodySetVerifier;
 use teamy_mover::transfer::tls::ClientEndpoint;
 use teamy_mover::transfer::tls::ServerEndpoint;
@@ -111,6 +112,109 @@ fn endpoints(
     )
     .unwrap();
     (client, server)
+}
+
+#[test]
+fn local_target_binds_exact_connect_ip_port_and_tls_pin() {
+    let certificates = fixture(ExtendedKeyUsagePurpose::ClientAuth, false);
+    let expected_pin = pin(&certificates.server_cert);
+    let expected_client_pin = pin(&certificates.client_cert);
+    let (client, server) = endpoints(certificates, "100.64.0.1", false, false);
+    let target = LocalDirectTarget::new(
+        "100.64.0.1:49152".parse().unwrap(),
+        expected_pin,
+        expected_client_pin,
+    )
+    .unwrap();
+    assert_eq!(target.authority(), "100.64.0.1:49152");
+    assert_eq!(
+        target.bind_address(),
+        "100.64.0.1:49152".parse::<std::net::SocketAddr>().unwrap()
+    );
+    target.check_tls(&client).unwrap();
+    target
+        .check_server("100.64.0.1:49152".parse().unwrap(), &server)
+        .unwrap();
+    assert!(
+        target
+            .check_server("0.0.0.0:49152".parse().unwrap(), &server)
+            .is_err()
+    );
+    assert!(
+        target
+            .check_server("100.64.0.1:49153".parse().unwrap(), &server)
+            .is_err()
+    );
+
+    let wrong_ip = LocalDirectTarget::new(
+        "100.64.0.2:49152".parse().unwrap(),
+        expected_pin,
+        expected_client_pin,
+    )
+    .unwrap();
+    assert!(wrong_ip.check_tls(&client).is_err());
+    let wrong_pin = LocalDirectTarget::new(
+        "100.64.0.1:49152".parse().unwrap(),
+        [0; 32],
+        expected_client_pin,
+    )
+    .unwrap();
+    assert!(wrong_pin.check_tls(&client).is_err());
+    assert!(
+        wrong_pin
+            .check_server("100.64.0.1:49152".parse().unwrap(), &server)
+            .is_err()
+    );
+    let wrong_client =
+        LocalDirectTarget::new("100.64.0.1:49152".parse().unwrap(), expected_pin, [0; 32]).unwrap();
+    assert!(wrong_client.check_tls(&client).is_err());
+    assert!(
+        wrong_client
+            .check_server("100.64.0.1:49152".parse().unwrap(), &server)
+            .is_err()
+    );
+    for address in ["127.0.0.1:49152", "100.128.0.1:49152", "100.64.0.1:0"] {
+        let _error = LocalDirectTarget::new(
+            address.parse().unwrap(),
+            expected_pin,
+            expected_client_pin,
+        )
+        .unwrap_err();
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[tokio::test]
+async fn local_target_mismatch_sends_no_connect_bytes() {
+    let certificates = fixture(ExtendedKeyUsagePurpose::ClientAuth, false);
+    let expected_pin = pin(&certificates.server_cert);
+    let expected_client_pin = pin(&certificates.client_cert);
+    let (client, _server) = endpoints(certificates, "100.64.0.1", false, false);
+    let wrong_ip = LocalDirectTarget::new(
+        "100.64.0.2:49152".parse().unwrap(),
+        expected_pin,
+        expected_client_pin,
+    )
+    .unwrap();
+    let wrong_client =
+        LocalDirectTarget::new("100.64.0.1:49152".parse().unwrap(), expected_pin, [0; 32]).unwrap();
+    for target in [wrong_ip, wrong_client] {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let result = teamy_mover::transfer::sender::send_approved_and_commit_via_local_target(
+            stream,
+            &target,
+            &client,
+            b"{}",
+            &"0".repeat(64),
+            "0123456789abcdef0123456789abcdef",
+            Vec::new(),
+        )
+        .await;
+        let _error = result.unwrap_err();
+        let mut written = Vec::new();
+        peer.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty());
+    }
 }
 
 #[tokio::test]

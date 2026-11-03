@@ -18,6 +18,66 @@ fn transfer_placeholders_refuse_to_run_and_do_not_create_files() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sender_limit_check_runs_in_child_without_starting_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+            .current_dir(dir.path())
+            .args([
+                "--output-format",
+                "json",
+                "transfer",
+                "send",
+                "--check-process-limit",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let result = run(&[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("\"address_space_bytes\":"));
+    assert!(output.contains("\"transfer_started\": false"));
+    let combined = run(&["--verify-only"]);
+    assert!(!combined.status.success());
+    assert!(combined.stdout.is_empty());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn receiver_limit_check_never_assigns_or_starts_a_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+        .current_dir(dir.path())
+        .args([
+            "--output-format",
+            "json",
+            "transfer",
+            "receive",
+            "--check-process-limit",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("\"job_configuration_verified\": true"));
+    assert!(output.contains("\"process_assigned\": false"));
+    assert!(output.contains("\"receiver_started\": false"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn validate_manifest_checks_local_approval_without_modifying_input() {
     let dir = tempfile::tempdir().unwrap();
