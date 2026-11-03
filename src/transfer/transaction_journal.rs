@@ -726,6 +726,12 @@ impl TransactionJournal {
         Ok(())
     }
 
+    /// A non-success rename may have changed the namespace; keep this instance
+    /// unusable and require local reconciliation under a newly acquired lock.
+    pub(crate) fn mark_publication_uncertain(&mut self) {
+        self.poisoned = true;
+    }
+
     /// Publication and receipt generation are deliberately unavailable.
     ///
     /// # Errors

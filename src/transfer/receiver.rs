@@ -655,33 +655,49 @@ mod tests {
 
     #[tokio::test]
     async fn protected_three_file_staging_reaches_journal_intent_without_publication() {
-        protected_three_file_simulation(false, false).await;
+        protected_three_file_simulation(false, false, None).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS rename and journal-reopen probe; not a durability or staging qualification"]
     async fn protected_three_file_rename_and_reopen_recovery() {
-        protected_three_file_simulation(true, false).await;
+        protected_three_file_simulation(true, false, None).await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS no-replace collision probe; not a staging qualification"]
     async fn protected_three_file_rename_preserves_existing_destination() {
-        protected_three_file_simulation(true, true).await;
+        protected_three_file_simulation(true, true, None).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS timeout after synthetic rename; not crash or durability proof"]
+    async fn protected_rename_timeout_keeps_resources_until_worker_finishes() {
+        protected_three_file_simulation(true, false, Some(false)).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS cancellation after synthetic rename; not crash or durability proof"]
+    async fn protected_rename_cancellation_keeps_resources_until_worker_finishes() {
+        protected_three_file_simulation(true, false, Some(true)).await;
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "keep the synthetic transfer, rename and reconciliation sequence together"
     )]
-    async fn protected_three_file_simulation(attempt_rename: bool, collision: bool) {
+    async fn protected_three_file_simulation(
+        attempt_rename: bool,
+        collision: bool,
+        interrupted: Option<bool>,
+    ) {
         use crate::transfer::windows_acl::{
             create_private_child, create_private_file, create_synthetic_private_directory,
             open_checked_child,
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            RenameOutcome, rename_with_permit, synthetic_permit,
+            RenameOutcome, rename_with_permit, synthetic_delayed_rename, synthetic_permit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
 
@@ -689,7 +705,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let parent = create_synthetic_private_directory(&dir.path().join("private")).unwrap();
             let parent_id = directory_identity(&parent).unwrap();
-            let mut stage = create_private_child(&parent, parent_id, "stage").unwrap();
+            let stage = create_private_child(&parent, parent_id, "stage").unwrap();
             let stage_id = directory_identity(&stage).unwrap();
             let journal_file = create_private_file(&parent, parent_id, "journal.bin").unwrap();
             let journal_id = journal_file.identity();
@@ -755,28 +771,77 @@ mod tests {
                 receiver_state.files.clear();
                 let mut journal = receiver_state.journal.take().unwrap();
                 drop(receiver_state);
-                let _wrong_target = rename_with_permit(synthetic_permit(), &mut journal, &mut stage, &parent, "wrong").unwrap_err();
+                let _wrong_target = journal.check_publication_binding(&parent, &stage, "wrong").unwrap_err();
+                if let Some(cancel) = interrupted {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+                    let gate = BlockingIoGate::default();
+                    let (release, wait) = std::sync::mpsc::channel::<()>();
+                    let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+                    let task = tokio::spawn(synthetic_delayed_rename(
+                        gate.clone(), journal, stage, parent, Duration::from_millis(500),
+                        move || { let _sent = started.send(()); let _released = wait.recv(); },
+                    ));
+                    tokio::time::timeout(Duration::from_secs(3), started_rx).await.unwrap().unwrap();
+                    if cancel {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                    } else {
+                        let _timeout = task.await.unwrap().unwrap_err();
+                    }
+                    let journal_path = dir.path().join("private/journal.bin");
+                    let _held = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                    assert!(dir.path().join("private/published").is_dir());
+                    assert!(gate.run(Duration::from_secs(1), || Ok(())).await.is_err());
+                    release.send(()).unwrap();
+                    let lock = tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if let Ok(lock) = ExclusiveFile::acquire(&journal_path, journal_id) { break lock; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("rename worker did not release resources");
+                    assert!(gate.run(Duration::from_secs(1), || Ok(())).await.is_err());
+                    let mut recovered = TransactionJournal::reopen(lock, &approval).unwrap();
+                    let parent_again = std::fs::OpenOptions::new().read(true)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+                        .open(dir.path().join("private")).unwrap();
+                    let published = open_checked_child(&parent_again, parent_id, "published", false).unwrap();
+                    assert!(recovered.intent_matches_directory(&published).unwrap());
+                    verify_entries(&published, stage_id, &entries).unwrap();
+                    for (id, entry) in ids.iter().zip(&entries) {
+                        let path = dir.path().join("private/published").join(entry.name);
+                        let mut file = ExclusiveFile::acquire(&path, entry.identity).unwrap();
+                        recovered.reverify_intent_file(id, file.file_mut(), now().unwrap()).unwrap();
+                    }
+                    assert!(recovered.commit().is_err());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
+                    return;
+                }
                 if collision {
                     let existing = create_private_child(&parent, parent_id, "published").unwrap();
                     let existing_id = directory_identity(&existing).unwrap();
                     let mut marker = create_private_file(&existing, existing_id, "existing.bin").unwrap();
                     marker.file_mut().write_all(b"already here").unwrap();
                     drop(marker);
-                    let outcome = rename_with_permit(synthetic_permit(), &mut journal, &mut stage, &parent, "published").unwrap();
-                    assert!(matches!(outcome, RenameOutcome::Unconfirmed { .. }));
-                    assert!(journal.intent_matches_directory(&stage).unwrap());
-                    assert!(!journal.intent_matches_directory(&existing).unwrap());
-                    verify_entries(&stage, stage_id, &entries).unwrap();
+                    let result = rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap();
+                    assert!(matches!(result.outcome, RenameOutcome::Unconfirmed { .. }));
+                    assert!(result.journal.intent_matches_directory(&result.stage).unwrap());
+                    assert!(!result.journal.intent_matches_directory(&existing).unwrap());
+                    verify_entries(&result.stage, stage_id, &entries).unwrap();
                     assert_eq!(std::fs::read(dir.path().join("private/published/existing.bin")).unwrap(), b"already here");
-                    assert!(journal.commit().is_err());
+                    assert!(result.journal.commit().is_err());
                     for (id, body) in ids.iter().zip(bodies) {
                         assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
                     }
                     return;
                 }
-                let outcome = rename_with_permit(synthetic_permit(), &mut journal, &mut stage, &parent, "published").unwrap();
-                assert_eq!(outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
-                drop(journal);
+                let result = rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap();
+                assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
+                drop(result.journal);
+                let parent = result.destination_parent;
+                let _held_stage = result.stage;
                 let journal_path = dir.path().join("private/journal.bin");
                 let reopened = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
                 let mut recovered = TransactionJournal::reopen(reopened, &approval).unwrap();
