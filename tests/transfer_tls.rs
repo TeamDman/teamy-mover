@@ -213,7 +213,7 @@ async fn local_target_mismatch_sends_no_connect_bytes() {
         let _error = result.unwrap_err();
         let mut written = Vec::new();
         peer.read_to_end(&mut written).await.unwrap();
-        assert!(written.is_empty());
+        assert_eq!(written, [0_u8; 0]);
     }
 }
 

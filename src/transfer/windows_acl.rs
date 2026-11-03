@@ -600,6 +600,45 @@ pub fn open_checked_child(
     name: &str,
     allow_create: bool,
 ) -> Result<File> {
+    open_checked_child_with_sharing(
+        parent,
+        expected_parent,
+        name,
+        allow_create,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+/// Open a strictly checked child with directory-list access and without delete
+/// sharing. This remains a non-authorizing primitive: strict ACL checks still
+/// apply, and the caller must separately qualify the root, ancestry, effective
+/// access, pre-existing handles, filesystem and retained transaction resources.
+/// In particular, it does not authorize or qualify the Downloads exception.
+///
+/// # Errors
+/// Rejects unsafe ACLs, identities, names, or incompatible existing handles.
+pub fn open_checked_child_without_delete_share(
+    parent: &File,
+    expected_parent: FileIdentity,
+    name: &str,
+    allow_create: bool,
+) -> Result<File> {
+    open_checked_child_with_sharing(
+        parent,
+        expected_parent,
+        name,
+        allow_create,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+}
+
+fn open_checked_child_with_sharing(
+    parent: &File,
+    expected_parent: FileIdentity,
+    name: &str,
+    allow_create: bool,
+    share_mode: FILE_SHARE_MODE,
+) -> Result<File> {
     ensure!(valid_component(name), "invalid directory component");
     ensure_not_impersonating()?;
     let user = process_user_sid()?;
@@ -644,7 +683,7 @@ pub fn open_checked_child(
             &raw mut status_block,
             None,
             FILE_ATTRIBUTE_DIRECTORY,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share_mode,
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             None,
@@ -1154,6 +1193,36 @@ mod tests {
         let user = PSID(words.as_mut_ptr().cast());
         let modify = descriptor("O:SYG:SYD:P(A;;FA;;;SY)(A;OICI;0x001301bf;;;WD)");
         assert!(verify_descriptor(modify.0, user, true).is_err());
+    }
+
+    #[test]
+    fn checked_child_no_delete_share_conflicts_with_delete_and_blocks_rename() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("private-parent");
+        let parent = create_synthetic_private_directory(&path).unwrap();
+        let parent_id = directory_identity(&parent).unwrap();
+        let child = create_private_child(&parent, parent_id, "child").unwrap();
+        let child_id = directory_identity(&child).unwrap();
+        drop(child);
+
+        let delete_handle = std::fs::OpenOptions::new()
+            .access_mode((DELETE | FILE_READ_ATTRIBUTES).0)
+            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path.join("child"))
+            .unwrap();
+        let _conflict =
+            open_checked_child_without_delete_share(&parent, parent_id, "child", false)
+                .unwrap_err();
+        drop(delete_handle);
+
+        let guarded =
+            open_checked_child_without_delete_share(&parent, parent_id, "child", false).unwrap();
+        assert_eq!(directory_identity(&guarded).unwrap(), child_id);
+        assert!(std::fs::rename(path.join("child"), path.join("moved")).is_err());
+        drop(guarded);
+        std::fs::rename(path.join("child"), path.join("moved")).unwrap();
+        assert!(path.join("moved").is_dir());
     }
 
     #[test]
