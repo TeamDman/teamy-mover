@@ -5,6 +5,7 @@ pub mod cli;
 mod elapsed_duration;
 pub mod logging_init;
 pub mod planning;
+pub mod transfer;
 #[cfg(windows)]
 mod windows_startup;
 

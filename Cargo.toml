@@ -16,6 +16,13 @@ arbitrary = { version = "1.4.1", features = ["derive"] }
 chrono = "0.4"
 color-eyre = "0.6.5"
 eyre = "0.6.12"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+sha2 = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
     "ansi",
@@ -32,6 +39,9 @@ facet-csv = { git = "https://github.com/TeamDman/facet.git", rev = "23ad4dcd0", 
 facet-json = { git = "https://github.com/TeamDman/facet.git", rev = "23ad4dcd0", package = "facet-json" }
 facet-pretty = { git = "https://github.com/TeamDman/facet.git", rev = "23ad4dcd0", package = "facet-pretty" }
 figue = { git = "https://github.com/TeamDman/facet.git", rev = "23ad4dcd0", package = "figue", features = ["arbitrary"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
