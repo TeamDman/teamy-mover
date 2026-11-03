@@ -28,11 +28,11 @@ fn verifies_multiple_chunks_and_empty_file() {
     assert_eq!(stream.finish().unwrap(), b"hello world");
 
     let manifest = approved(b"");
-    assert!(
+    assert_eq!(
         FileVerifier::new(manifest.files().next().unwrap(), Vec::new())
             .finish()
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        Vec::<u8>::new()
     );
 }
 
