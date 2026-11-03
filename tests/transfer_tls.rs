@@ -555,6 +555,19 @@ impl TransferWire for MemoryTransfer {
         }
     }
 
+    fn receipt(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, TransferError>> + Send {
+        let result = if self.matches(&transaction_id, &manifest_sha256) {
+            Err(TransferError::NotReady)
+        } else {
+            Err(TransferError::Rejected)
+        };
+        std::future::ready(result)
+    }
+
     fn commit(
         &self,
         transaction_id: String,

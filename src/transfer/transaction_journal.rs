@@ -855,6 +855,56 @@ impl TransactionJournal {
         self.reserved[2]
     }
 
+    /// Re-read a recorded receipt after the caller has established a separate
+    /// qualified replay permit. This does not itself validate a final directory
+    /// or authorize a client. The live path remains gated by that permit.
+    pub(crate) fn read_recorded_receipt_before(
+        &mut self,
+        deadline: std::time::Instant,
+        gate: &BlockingIoGate,
+    ) -> Result<Vec<u8>> {
+        let expiry = self.manifest.expires_unix();
+        let checkpoint = || {
+            gate.ensure_active()?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "receipt deadline expired"
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            ensure!(now < expiry, "approval expired");
+            Ok(())
+        };
+        ensure!(
+            !self.poisoned && !self.progress.aborted,
+            "journal unavailable"
+        );
+        ensure!(
+            self.progress.published.is_some()
+                && self.progress.published == self.progress.commit_intent,
+            "published record missing"
+        );
+        let receipt = self
+            .progress
+            .receipt
+            .clone()
+            .ok_or_else(|| eyre::eyre!("receipt missing"))?;
+        ensure!(
+            receipt == expected_receipt(&self.manifest, &self.binding)?,
+            "receipt mismatch"
+        );
+        checkpoint()?;
+        self.lock.verify()?;
+        checkpoint()?;
+        ensure!(
+            read_log(&mut self.lock)? == self.records,
+            "journal changed while held"
+        );
+        checkpoint()?;
+        Ok(receipt.into_bytes())
+    }
+
     /// Persist a successful, locally observed publication and deterministic
     /// unconfirmed-durability receipt. This method is reachable only with the
     /// private evidence produced by the still-gated rename implementation.

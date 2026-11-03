@@ -44,12 +44,37 @@ const MAX_IDLE: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct StagingPermit(());
 
+/// Reserved for a future reviewed replay gate that retains qualified final
+/// directory, file and transaction handles. No operational constructor exists.
+/// Before adding one, bind the permit to the live authenticated connection and
+/// revoke it on disconnect; the current authentication flag is not a liveness
+/// guarantee. A fresh authorization mechanism is also needed after expiry.
+#[derive(Debug)]
+pub struct ReceiptReplayPermit {
+    granted_at: std::time::Instant,
+    expires_at: std::time::Instant,
+}
+
+impl ReceiptReplayPermit {
+    fn remaining(&self) -> Option<Duration> {
+        let latest = self.granted_at.checked_add(Duration::from_mins(1))?;
+        if self.expires_at > latest || std::time::Instant::now() < self.granted_at {
+            return None;
+        }
+        self.expires_at
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|value| !value.is_zero())
+    }
+}
+
 struct State {
     journal: Option<TransactionJournal>,
     manifest: ApprovedManifest,
     digest: String,
     files: BTreeMap<String, ExclusiveFile>,
     begun: bool,
+    authenticated: bool,
+    replay_permit: Option<ReceiptReplayPermit>,
     in_flight_or_failed: bool,
     deadline: tokio::time::Instant,
     io_gate: BlockingIoGate,
@@ -188,6 +213,8 @@ impl Receiver {
                 digest: approval.manifest_sha256.to_owned(),
                 files,
                 begun: false,
+                authenticated: false,
+                replay_permit: None,
                 in_flight_or_failed: false,
                 deadline: tokio::time::Instant::now() + MAX_SESSION,
                 io_gate: gate,
@@ -228,7 +255,11 @@ impl Receiver {
                 .is_ok(),
             "receiver connection already started"
         );
-        vox_transport::establish_server(stream, TransferWireDispatcher::new(self)).await
+        let state = Arc::clone(&self.state);
+        let connection =
+            vox_transport::establish_server(stream, TransferWireDispatcher::new(self)).await?;
+        state.lock().await.authenticated = true;
+        Ok(connection)
     }
 }
 
@@ -303,6 +334,57 @@ impl TransferWire for Receiver {
         } else {
             Ok(TransferState::Receiving)
         }
+    }
+
+    async fn receipt(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> std::result::Result<Vec<u8>, TransferError> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_error| TransferError::NotReady)?;
+        check(&state, &transaction_id, &manifest_sha256)?;
+        if !state.authenticated || !state.begun || state.replay_permit.is_none() {
+            return Err(TransferError::NotReady);
+        }
+        if state.journal.is_none() {
+            return Err(TransferError::Failed);
+        }
+        let replay_remaining = state
+            .replay_permit
+            .as_ref()
+            .and_then(ReceiptReplayPermit::remaining)
+            .ok_or(TransferError::Expired)?;
+        let (budget, _) = worker_budget(&state).map_err(|_error| TransferError::Expired)?;
+        let budget = budget.min(replay_remaining);
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or(TransferError::Failed)?;
+        let permit = state.replay_permit.take().ok_or(TransferError::NotReady)?;
+        let mut journal = state.journal.take().ok_or(TransferError::Failed)?;
+        state.in_flight_or_failed = true;
+        let gate = state.io_gate.clone();
+        let worker_gate = gate.clone();
+        let result = gate
+            .run(budget, move || {
+                let bytes = journal.read_recorded_receipt_before(deadline, &worker_gate)?;
+                worker_gate.ensure_active()?;
+                Ok((journal, permit, bytes))
+            })
+            .await;
+        let (journal, permit, bytes) = result.map_err(|_error| TransferError::Failed)?;
+        state.journal = Some(journal);
+        state.replay_permit = Some(permit);
+        state.in_flight_or_failed = false;
+        check(&state, &transaction_id, &manifest_sha256)?;
+        state
+            .replay_permit
+            .as_ref()
+            .and_then(ReceiptReplayPermit::remaining)
+            .ok_or(TransferError::Expired)?;
+        Ok(bytes)
     }
 
     async fn commit(
@@ -481,6 +563,14 @@ mod tests {
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
+    fn synthetic_replay_permit() -> ReceiptReplayPermit {
+        let granted_at = std::time::Instant::now();
+        ReceiptReplayPermit {
+            granted_at,
+            expires_at: granted_at + Duration::from_mins(1),
+        }
+    }
+
     fn certificates() -> (ClientEndpoint, ServerEndpoint, String, String) {
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -643,6 +733,10 @@ mod tests {
             file.read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes, b"hello");
             drop(state);
+            assert!(matches!(
+                control.receipt(ID.into(), fixture.digest.clone()).await,
+                Err(TransferError::NotReady)
+            ));
             assert!(matches!(
                 control.commit(ID.into(), fixture.digest.clone()).await,
                 Err(TransferError::NotReady)
@@ -851,7 +945,7 @@ mod tests {
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
 
-        tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(Duration::from_secs(15), Box::pin(async {
             let crash_root = std::env::var_os("TEAMY_TEST_CRASH_ROOT");
             let crash_point = crash_root.as_ref().map(|_| std::env::var("TEAMY_TEST_CRASH_POINT").unwrap());
             assert!(crash_point.as_deref().is_none_or(|point| point == "after-rename" || point == "after-published"));
@@ -1014,9 +1108,50 @@ mod tests {
                 assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
                 let receipt = result.journal.recorded_receipt().unwrap().to_owned();
                 assert!(receipt.contains("published-durability-unconfirmed"));
-                drop(result.journal);
                 let parent = result.destination_parent;
                 let _held_stage = result.stage;
+                // This test fabricates a replay permit solely to exercise the
+                // authenticated protocol. No production permit constructor exists.
+                let replay = Receiver {
+                    state: Arc::new(Mutex::new(State {
+                        journal: Some(result.journal),
+                        manifest: parse_approved_manifest(raw.as_bytes(), &digest, ID, now().unwrap()).unwrap(),
+                        digest: digest.clone(), files: BTreeMap::new(), begun: false,
+                        authenticated: false, replay_permit: Some(synthetic_replay_permit()),
+                        in_flight_or_failed: false, deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                        io_gate: BlockingIoGate::default(), before_file_io: None,
+                    })),
+                    started: Arc::new(AtomicBool::new(false)),
+                };
+                let replay_control = replay.clone();
+                replay_control.begin(1, ID.into(), digest.clone()).await.unwrap();
+                assert!(matches!(replay_control.receipt(ID.into(), digest.clone()).await, Err(TransferError::NotReady)));
+                let (replay_left, replay_right) = tokio::io::duplex(128 * 1024);
+                let (client_tls, server_tls) = tokio::join!(client.connect(replay_left), server.accept(replay_right));
+                let (client_conn, server_conn) = tokio::join!(
+                    vox_transport::establish_client(client_tls.unwrap()), replay.establish(server_tls.unwrap())
+                );
+                let replay_client = client_conn.unwrap();
+                let _replay_server = server_conn.unwrap();
+                let lane: crate::transfer::wire::TransferWireClient = replay_client.open_lane().await.unwrap();
+                lane.begin(1, ID.into(), digest.clone()).await.unwrap();
+                assert!(matches!(lane.receipt(ID.into(), "0".repeat(64)).await, Err(vox::VoxError::User(error)) if *error == TransferError::Rejected));
+                assert_eq!(lane.receipt(ID.into(), digest.clone()).await.unwrap(), receipt.as_bytes());
+                assert_eq!(lane.receipt(ID.into(), digest.clone()).await.unwrap(), receipt.as_bytes());
+                let mut replay_state = replay_control.state.lock().await;
+                let permit = replay_state.replay_permit.as_mut().unwrap();
+                permit.expires_at = permit.granted_at + Duration::from_secs(61);
+                drop(replay_state);
+                assert!(matches!(lane.receipt(ID.into(), digest.clone()).await, Err(vox::VoxError::User(error)) if *error == TransferError::Expired));
+                let mut replay_state = replay_control.state.lock().await;
+                replay_state.replay_permit = Some(synthetic_replay_permit());
+                replay_state.deadline = tokio::time::Instant::now();
+                drop(replay_state);
+                assert!(matches!(lane.receipt(ID.into(), digest.clone()).await, Err(vox::VoxError::User(error)) if *error == TransferError::Expired));
+                let mut replay_state = replay_control.state.lock().await;
+                let replay_journal = replay_state.journal.take().unwrap();
+                drop(replay_state);
+                drop(replay_journal);
                 let journal_path = dir.path().join("private/journal.bin");
                 let reopened = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
                 let mut recovered = TransactionJournal::reopen(reopened, &approval).unwrap();
@@ -1086,7 +1221,7 @@ mod tests {
             for (id, body) in ids.iter().zip(bodies) {
                 assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
             }
-        }).await.expect("protected receiver integration test timed out");
+        })).await.expect("protected receiver integration test timed out");
     }
 
     #[tokio::test]
@@ -1169,6 +1304,12 @@ mod tests {
     #[tokio::test]
     async fn rejects_tls_peer_not_bound_to_journal() {
         let fixture = fixture(true, false).await;
+        let control = fixture.receiver.clone();
+        control.state.lock().await.replay_permit = Some(synthetic_replay_permit());
+        control
+            .begin(1, ID.into(), fixture.digest.clone())
+            .await
+            .unwrap();
         let (left, right) = tokio::io::duplex(128 * 1024);
         let (client_tls, server_tls) =
             tokio::join!(fixture.client.connect(left), fixture.server.accept(right));
@@ -1179,6 +1320,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not match journal"));
+        assert!(matches!(
+            control.receipt(ID.into(), fixture.digest.clone()).await,
+            Err(TransferError::NotReady)
+        ));
         assert_eq!(std::fs::read(&fixture.source).unwrap(), b"hello");
     }
 

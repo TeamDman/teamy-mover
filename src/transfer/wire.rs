@@ -54,6 +54,15 @@ pub trait TransferWire {
         manifest_sha256: String,
     ) -> Result<TransferState, TransferError>;
 
+    /// Retrieve a previously persisted receipt only in an explicitly approved,
+    /// authenticated reconciliation window. Implementations must fail closed
+    /// without a qualified local replay permit.
+    async fn receipt(
+        &self,
+        transaction_id: String,
+        manifest_sha256: String,
+    ) -> Result<Vec<u8>, TransferError>;
+
     async fn commit(
         &self,
         transaction_id: String,
