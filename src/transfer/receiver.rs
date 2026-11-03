@@ -1172,7 +1172,7 @@ mod tests {
                 let _expired_live_reopen = TransactionJournal::reopen(lock, &expired).unwrap_err();
                 let original_journal = std::fs::read(&journal_path).unwrap();
                 let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
-                let mut inspection = LocalInspection::open(lock, &expired).unwrap();
+                let inspection = LocalInspection::open(lock, &expired).unwrap();
                 assert_eq!(inspection.disposition(), RecoveryDisposition::InspectPublished);
                 assert!(inspection.intent_matches_directory(&published).unwrap());
                 let mut inspected_files = BTreeMap::new();
@@ -1180,6 +1180,11 @@ mod tests {
                     let path = dir.path().join("private/published").join(entry.name);
                     inspected_files.insert((*id).to_owned(), ExclusiveFile::acquire(&path, entry.identity).unwrap());
                 }
+                let snapshot = inspection.inspect_final_contents_bounded(
+                    parent, inspected_files, BlockingIoGate::default(), Duration::from_secs(3),
+                ).await.unwrap();
+                let _held_journal = ExclusiveFile::acquire(&journal_path, journal_id).unwrap_err();
+                let (mut inspection, parent, mut inspected_files) = snapshot.into_parts();
                 inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap();
                 let missing = inspected_files.remove("one").unwrap();
                 let _missing = inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap_err();

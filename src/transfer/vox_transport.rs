@@ -112,6 +112,13 @@ where
 }
 
 impl BoundedConnection {
+    /// Wait until Vox reports that this connection's control lane is closed.
+    /// This signal is asynchronous and does not prove that an otherwise open
+    /// peer remains reachable, nor does it by itself authorize a receipt.
+    pub async fn closed(&self) {
+        self.0.closed().await;
+    }
+
     /// Open a typed lane using explicit limits instead of Vox's wider defaults.
     ///
     /// # Errors
@@ -172,6 +179,21 @@ mod tests {
         assert_eq!(first.echo("synthetic".into()).await.unwrap(), "synthetic");
         let second = client.open_lane::<EchoClient>().await;
         assert!(second.is_err(), "a second peer lane should be rejected");
+    }
+
+    #[tokio::test]
+    async fn peer_shutdown_resolves_connection_closed_signal() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let (client, server) = tokio::join!(
+            initiate(client_io),
+            accept(server_io, EchoDispatcher::new(EchoService))
+        );
+        let client = client.unwrap();
+        let server = server.unwrap();
+        client.shutdown().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server.closed())
+            .await
+            .expect("server did not observe peer closure");
     }
 
     #[tokio::test]

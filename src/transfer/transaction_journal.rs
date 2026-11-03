@@ -979,6 +979,24 @@ pub struct LocalInspection {
     journal: TransactionJournal,
 }
 
+/// Owned result of a bounded read-only inspection. Holding this value retains
+/// the journal lock, parent and file handles, but does not qualify ancestry,
+/// retain the final-directory handle, or authorize replay or publication.
+#[derive(Debug)]
+pub struct InspectionSnapshot {
+    inspection: LocalInspection,
+    parent: File,
+    files: BTreeMap<String, ExclusiveFile>,
+}
+
+impl InspectionSnapshot {
+    /// Return the held resources for further local inspection.
+    #[must_use]
+    pub fn into_parts(self) -> (LocalInspection, File, BTreeMap<String, ExclusiveFile>) {
+        (self.inspection, self.parent, self.files)
+    }
+}
+
 struct ExpectedInspectionFile {
     id: String,
     name: String,
@@ -1032,6 +1050,16 @@ impl LocalInspection {
     /// Rejects absent intent, unknown or unverified files, identity changes,
     /// digest or length mismatches, and read errors.
     pub fn verify_recorded_file(&mut self, id: &str, file: &mut ExclusiveFile) -> Result<()> {
+        self.verify_recorded_file_with(id, file, &|| Ok(()))
+    }
+
+    fn verify_recorded_file_with(
+        &mut self,
+        id: &str,
+        file: &mut ExclusiveFile,
+        checkpoint: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        checkpoint()?;
         ensure!(
             self.journal.progress.commit_intent.is_some(),
             "commit intent is missing"
@@ -1059,13 +1087,16 @@ impl LocalInspection {
         let mut verifier = FileVerifier::new(approved, std::io::sink());
         let mut buffer = [0_u8; 16 * 1024];
         loop {
+            checkpoint()?;
             let count = file.file_mut().read(&mut buffer)?;
+            checkpoint()?;
             if count == 0 {
                 break;
             }
             verifier.push(&buffer[..count])?;
         }
         verifier.finish()?;
+        checkpoint()?;
         file.verify()?;
         ensure!(
             identity(file.file_mut())? == expected_identity,
@@ -1092,10 +1123,64 @@ impl LocalInspection {
         parent: &File,
         files: &mut BTreeMap<String, ExclusiveFile>,
     ) -> Result<()> {
+        self.inspect_final_contents_with(parent, files, &|| Ok(()))
+    }
+
+    /// Inspect under a single-flight deadline while moving all supplied handles
+    /// into the blocking worker. Timeout or cancellation cannot cancel a kernel
+    /// call: its worker retains the handles until that call returns, and the
+    /// gate is poisoned. A successful result is still only local inspection.
+    ///
+    /// # Errors
+    /// Rejects unsafe or changed contents, a busy/poisoned gate, or timeout.
+    pub async fn inspect_final_contents_bounded(
+        self,
+        parent: File,
+        files: BTreeMap<String, ExclusiveFile>,
+        gate: BlockingIoGate,
+        budget: std::time::Duration,
+    ) -> Result<InspectionSnapshot> {
+        ensure!(
+            !budget.is_zero() && budget <= std::time::Duration::from_secs(30),
+            "inspection budget must be between zero and 30 seconds"
+        );
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| eyre::eyre!("inspection deadline overflow"))?;
+        let worker_gate = gate.clone();
+        gate.run(budget, move || {
+            let checkpoint = || {
+                worker_gate.ensure_active()?;
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "inspection deadline expired"
+                );
+                Ok(())
+            };
+            let mut inspection = self;
+            let mut files = files;
+            inspection.inspect_final_contents_with(&parent, &mut files, &checkpoint)?;
+            checkpoint()?;
+            Ok(InspectionSnapshot {
+                inspection,
+                parent,
+                files,
+            })
+        })
+        .await
+    }
+
+    fn inspect_final_contents_with(
+        &mut self,
+        parent: &File,
+        files: &mut BTreeMap<String, ExclusiveFile>,
+        checkpoint: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
         use super::windows_acl::open_checked_child;
         use super::windows_lock::FileIdentity;
         use super::windows_stage::{ExpectedEntry, verify_entries};
 
+        checkpoint()?;
         ensure!(
             self.journal.progress.commit_intent.is_some(),
             "commit intent is missing"
@@ -1108,6 +1193,7 @@ impl LocalInspection {
             read_log(&mut self.journal.lock)? == self.journal.records,
             "journal changed while held"
         );
+        checkpoint()?;
         let actual_parent = directory_identity(parent)?;
         let expected_parent = self.journal.reserved[0];
         ensure!(
@@ -1116,7 +1202,9 @@ impl LocalInspection {
             "parent identity mismatch"
         );
         let final_name = self.journal.binding.final_component().to_owned();
+        checkpoint()?;
         let final_directory = open_checked_child(parent, actual_parent, &final_name, false)?;
+        checkpoint()?;
         ensure!(
             self.intent_matches_directory(&final_directory)?,
             "final directory identity mismatch"
@@ -1155,15 +1243,20 @@ impl LocalInspection {
                 size: item.size,
             })
             .collect();
+        checkpoint()?;
         verify_entries(&final_directory, stage_id, &entries)?;
+        checkpoint()?;
         for item in &expected {
             let file = files
                 .get_mut(&item.id)
                 .ok_or_else(|| eyre::eyre!("file set mismatch"))?;
-            self.verify_recorded_file(&item.id, file)?;
+            self.verify_recorded_file_with(&item.id, file, checkpoint)?;
         }
+        checkpoint()?;
         verify_entries(&final_directory, stage_id, &entries)?;
+        checkpoint()?;
         let reopened = open_checked_child(parent, actual_parent, &final_name, false)?;
+        checkpoint()?;
         ensure!(
             directory_identity(&reopened)? == stage_id,
             "final directory edge changed"
@@ -1176,6 +1269,7 @@ impl LocalInspection {
             read_log(&mut self.journal.lock)? == self.journal.records,
             "journal changed while held"
         );
+        checkpoint()?;
         Ok(())
     }
 }
