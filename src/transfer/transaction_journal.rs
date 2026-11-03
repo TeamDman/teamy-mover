@@ -929,6 +929,13 @@ pub struct LocalInspection {
     journal: TransactionJournal,
 }
 
+struct ExpectedInspectionFile {
+    id: String,
+    name: String,
+    identity: super::windows_lock::FileIdentity,
+    size: u64,
+}
+
 impl LocalInspection {
     /// Reopen a locally selected journal under its exclusive lock. Expiry is
     /// not treated as live authorization; all other manifest, pin, identity,
@@ -1013,6 +1020,111 @@ impl LocalInspection {
         ensure!(
             identity(file.file_mut())? == expected_identity,
             "file identity changed"
+        );
+        Ok(())
+    }
+
+    /// Inspect the recorded final component relative to its approved parent,
+    /// compare the exact set of names, sizes and identities, and rehash every
+    /// supplied exclusively held file. The caller must retain the parent and
+    /// file handles and serialize directory enumeration for the entire call.
+    ///
+    /// This is not a qualification token: it does not establish protected
+    /// ancestry, exclude pre-existing handles or privileged users, prove crash
+    /// durability, return a receipt, or authorize network access. Run this
+    /// potentially blocking operation under an owner-controlled deadline.
+    ///
+    /// # Errors
+    /// Rejects missing intent, a changed journal, wrong parent or final identity,
+    /// unexpected/missing files, unsafe handles, and content mismatches.
+    pub fn inspect_final_contents(
+        &mut self,
+        parent: &File,
+        files: &mut BTreeMap<String, ExclusiveFile>,
+    ) -> Result<()> {
+        use super::windows_acl::open_checked_child;
+        use super::windows_lock::FileIdentity;
+        use super::windows_stage::{ExpectedEntry, verify_entries};
+
+        ensure!(
+            self.journal.progress.commit_intent.is_some(),
+            "commit intent is missing"
+        );
+        ensure!(
+            files.len() == self.journal.manifest.files().len(),
+            "file set mismatch"
+        );
+        ensure!(
+            read_log(&mut self.journal.lock)? == self.journal.records,
+            "journal changed while held"
+        );
+        let actual_parent = directory_identity(parent)?;
+        let expected_parent = self.journal.reserved[0];
+        ensure!(
+            actual_parent.volume_serial == expected_parent.volume_serial
+                && actual_parent.file_index == expected_parent.file_index,
+            "parent identity mismatch"
+        );
+        let final_name = self.journal.binding.final_component().to_owned();
+        let final_directory = open_checked_child(parent, actual_parent, &final_name, false)?;
+        ensure!(
+            self.intent_matches_directory(&final_directory)?,
+            "final directory identity mismatch"
+        );
+        let stage = self.journal.reserved[1];
+        let stage_id = FileIdentity {
+            volume_serial: stage.volume_serial,
+            file_index: stage.file_index,
+        };
+        let mut expected = Vec::with_capacity(files.len());
+        for approved in self.journal.manifest.files() {
+            let entry = self
+                .journal
+                .files
+                .get(approved.id())
+                .ok_or_else(|| eyre::eyre!("file observation missing"))?;
+            ensure!(
+                entry.verified && files.contains_key(approved.id()),
+                "file set mismatch"
+            );
+            expected.push(ExpectedInspectionFile {
+                id: approved.id().to_owned(),
+                name: approved.name().to_owned(),
+                identity: FileIdentity {
+                    volume_serial: entry.observation.object.volume_serial,
+                    file_index: entry.observation.object.file_index,
+                },
+                size: approved.size(),
+            });
+        }
+        let entries: Vec<_> = expected
+            .iter()
+            .map(|item| ExpectedEntry {
+                name: item.name.as_str(),
+                identity: item.identity,
+                size: item.size,
+            })
+            .collect();
+        verify_entries(&final_directory, stage_id, &entries)?;
+        for item in &expected {
+            let file = files
+                .get_mut(&item.id)
+                .ok_or_else(|| eyre::eyre!("file set mismatch"))?;
+            self.verify_recorded_file(&item.id, file)?;
+        }
+        verify_entries(&final_directory, stage_id, &entries)?;
+        let reopened = open_checked_child(parent, actual_parent, &final_name, false)?;
+        ensure!(
+            directory_identity(&reopened)? == stage_id,
+            "final directory edge changed"
+        );
+        ensure!(
+            directory_identity(parent)? == actual_parent,
+            "parent identity changed"
+        );
+        ensure!(
+            read_log(&mut self.journal.lock)? == self.journal.records,
+            "journal changed while held"
         );
         Ok(())
     }

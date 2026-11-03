@@ -88,6 +88,11 @@ fn pin_is_valid(pin: &str) -> bool {
 
 impl JournalBinding {
     #[cfg(windows)]
+    pub(crate) fn final_component(&self) -> &str {
+        &self.0.final_name
+    }
+
+    #[cfg(windows)]
     pub(crate) fn receipt_context(&self) -> (&str, &str) {
         (&self.0.manifest_sha256, &self.0.transaction_id)
     }

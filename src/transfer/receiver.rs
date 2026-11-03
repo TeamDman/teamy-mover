@@ -688,6 +688,148 @@ mod tests {
         protected_three_file_simulation(true, false, Some((false, true))).await;
     }
 
+    #[tokio::test]
+    async fn synthetic_crash_child() {
+        if std::env::var_os("TEAMY_TEST_CRASH_ROOT").is_some() {
+            protected_three_file_simulation(true, false, None).await;
+            panic!("synthetic crash hook did not terminate the child");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual NTFS abrupt-process recovery probe; not power-loss durability proof"]
+    fn abrupt_process_after_published_record_allows_local_inspection_only() {
+        abrupt_process_recovery("after-published", 77, true);
+    }
+
+    #[test]
+    #[ignore = "manual NTFS abrupt-process recovery probe; not power-loss durability proof"]
+    fn abrupt_process_after_rename_remains_ambiguous() {
+        abrupt_process_recovery("after-rename", 78, false);
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the child-process crash and local inspection sequence together"
+    )]
+    fn abrupt_process_recovery(crash_point: &str, expected_exit: i32, published_recorded: bool) {
+        use crate::transfer::recovery::RecoveryDisposition;
+        use crate::transfer::transaction_journal::LocalInspection;
+        use crate::transfer::windows_acl::open_checked_child;
+        use crate::transfer::windows_lock::directory_identity;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::process::{Command, Stdio};
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let verified_root = std::fs::canonicalize(root.path()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transfer::receiver::tests::synthetic_crash_child",
+                "--nocapture",
+            ])
+            .env("TEAMY_TEST_CRASH_ROOT", &verified_root)
+            .env("TEAMY_TEST_CRASH_POINT", crash_point)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _killed = child.kill();
+                let _waited = child.wait();
+                panic!("synthetic crash child did not terminate");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(status.code(), Some(expected_exit));
+        let children: Vec<_> = std::fs::read_dir(&verified_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(children.len(), 1);
+        let fixture = std::fs::canonicalize(&children[0]).unwrap();
+        assert!(fixture.starts_with(&verified_root) && fixture != verified_root);
+        let config = std::fs::read_to_string(fixture.join("fixture-approval.txt")).unwrap();
+        let values: Vec<_> = config.lines().collect();
+        assert_eq!(values.len(), 4);
+        let private_path = fixture.join("private");
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(&private_path)
+            .unwrap();
+        let parent_id = directory_identity(&parent).unwrap();
+        let published = open_checked_child(&parent, parent_id, "published", false).unwrap();
+        let stage_id = directory_identity(&published).unwrap();
+        let journal_path = private_path.join("journal.bin");
+        let journal_id = regular_file_identity(&File::open(&journal_path).unwrap()).unwrap();
+        let object = |id: crate::transfer::windows_lock::FileIdentity| ObjectIdentity {
+            volume_serial: id.volume_serial,
+            file_index: id.file_index,
+        };
+        let approval = JournalApproval {
+            manifest_bytes: values[0].as_bytes(),
+            manifest_sha256: values[1],
+            transaction_id: ID,
+            client_pin: values[2],
+            server_pin: values[3],
+            destination_parent: object(parent_id),
+            stage_directory: object(stage_id),
+            journal_file: object(journal_id),
+            final_name: "published",
+            now_unix: now().unwrap(),
+        };
+        let original_journal = std::fs::read(&journal_path).unwrap();
+        let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+        let journal = TransactionJournal::reopen(lock, &approval).unwrap();
+        assert_eq!(journal.has_published_record(), published_recorded);
+        assert!(journal.recorded_receipt().is_none());
+        drop(journal);
+        let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
+        let mut inspection = LocalInspection::open(lock, &approval).unwrap();
+        assert_eq!(
+            inspection.disposition(),
+            if published_recorded {
+                RecoveryDisposition::InspectPublished
+            } else {
+                RecoveryDisposition::InspectAmbiguousPublication
+            }
+        );
+        let ids = ["one", "two", "three"];
+        let names = ["one.bin", "two.bin", "three.bin"];
+        let bodies: [&[u8]; 3] = [b"one", b"two", b"three"];
+        let mut files = BTreeMap::new();
+        for (id, name) in ids.iter().zip(names) {
+            let path = private_path.join("published").join(name);
+            let file_id = regular_file_identity(&File::open(&path).unwrap()).unwrap();
+            files.insert(
+                (*id).to_owned(),
+                ExclusiveFile::acquire(&path, file_id).unwrap(),
+            );
+        }
+        inspection
+            .inspect_final_contents(&parent, &mut files)
+            .unwrap();
+        drop(files);
+        drop(inspection);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
+        for (id, body) in ids.iter().zip(bodies) {
+            assert_eq!(
+                std::fs::read(fixture.join(format!("source-{id}"))).unwrap(),
+                body
+            );
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "keep the synthetic transfer, rename and reconciliation sequence together"
@@ -710,7 +852,14 @@ mod tests {
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
 
         tokio::time::timeout(Duration::from_secs(15), async {
-            let dir = tempfile::tempdir().unwrap();
+            let crash_root = std::env::var_os("TEAMY_TEST_CRASH_ROOT");
+            let crash_point = crash_root.as_ref().map(|_| std::env::var("TEAMY_TEST_CRASH_POINT").unwrap());
+            assert!(crash_point.as_deref().is_none_or(|point| point == "after-rename" || point == "after-published"));
+            let dir = if let Some(root) = &crash_root {
+                tempfile::Builder::new().prefix("crash-child-").tempdir_in(root).unwrap()
+            } else {
+                tempfile::tempdir().unwrap()
+            };
             let parent = create_synthetic_private_directory(&dir.path().join("private")).unwrap();
             let parent_id = directory_identity(&parent).unwrap();
             let stage = create_private_child(&parent, parent_id, "stage").unwrap();
@@ -738,6 +887,9 @@ mod tests {
             let raw = format!(r#"{{"aggregate_bytes":11,"expires_unix":{expiry},"file_count":3,"files":[{}],"transaction_id":"{ID}","version":1}}"#, manifest_files.join(","));
             let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
             let (client, server, client_pin, server_pin) = certificates();
+            if crash_root.is_some() {
+                std::fs::write(dir.path().join("fixture-approval.txt"), format!("{raw}\n{digest}\n{client_pin}\n{server_pin}\n")).unwrap();
+            }
             let object = |id: crate::transfer::windows_lock::FileIdentity| ObjectIdentity {
                 volume_serial: id.volume_serial, file_index: id.file_index,
             };
@@ -780,6 +932,9 @@ mod tests {
                 let mut journal = receiver_state.journal.take().unwrap();
                 drop(receiver_state);
                 let _wrong_target = journal.check_publication_binding(&parent, &stage, "wrong").unwrap_err();
+                if crash_point.as_deref() == Some("after-published") {
+                    journal.set_before_receipt(Box::new(|| std::process::exit(77)));
+                }
                 if let Some((cancel, after_published)) = interrupted {
                     use std::os::windows::fs::OpenOptionsExt;
                     use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
@@ -851,7 +1006,11 @@ mod tests {
                     }
                     return;
                 }
-                let result = rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap();
+                let result = if crash_point.as_deref() == Some("after-rename") {
+                    synthetic_delayed_rename(BlockingIoGate::default(), journal, stage, parent, Duration::from_secs(3), || std::process::exit(78)).await.unwrap()
+                } else {
+                    rename_with_permit(synthetic_permit(), journal, stage, parent, "published".to_owned(), Duration::from_secs(3)).await.unwrap()
+                };
                 assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
                 let receipt = result.journal.recorded_receipt().unwrap().to_owned();
                 assert!(receipt.contains("published-durability-unconfirmed"));
@@ -876,15 +1035,50 @@ mod tests {
                 let expired = JournalApproval { now_unix: expiry, ..approval };
                 let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
                 let _expired_live_reopen = TransactionJournal::reopen(lock, &expired).unwrap_err();
+                let original_journal = std::fs::read(&journal_path).unwrap();
                 let lock = ExclusiveFile::acquire(&journal_path, journal_id).unwrap();
                 let mut inspection = LocalInspection::open(lock, &expired).unwrap();
                 assert_eq!(inspection.disposition(), RecoveryDisposition::InspectPublished);
                 assert!(inspection.intent_matches_directory(&published).unwrap());
+                let mut inspected_files = BTreeMap::new();
                 for (id, entry) in ids.iter().zip(&entries) {
                     let path = dir.path().join("private/published").join(entry.name);
-                    let mut file = ExclusiveFile::acquire(&path, entry.identity).unwrap();
-                    inspection.verify_recorded_file(id, &mut file).unwrap();
+                    inspected_files.insert((*id).to_owned(), ExclusiveFile::acquire(&path, entry.identity).unwrap());
                 }
+                inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap();
+                let missing = inspected_files.remove("one").unwrap();
+                let _missing = inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap_err();
+                inspected_files.insert("one".to_owned(), missing);
+                let _wrong_parent = inspection.inspect_final_contents(&published, &mut inspected_files).unwrap_err();
+                let extra_path = dir.path().join("private/published/extra.bin");
+                std::fs::write(&extra_path, b"extra").unwrap();
+                let _extra = inspection.inspect_final_contents(&parent, &mut inspected_files).unwrap_err();
+                std::fs::remove_file(&extra_path).unwrap();
+                drop(inspected_files);
+                std::fs::write(dir.path().join("private/published/one.bin"), b"ONE").unwrap();
+                let mut changed_files = BTreeMap::new();
+                for (id, entry) in ids.iter().zip(&entries) {
+                    let path = dir.path().join("private/published").join(entry.name);
+                    changed_files.insert((*id).to_owned(), ExclusiveFile::acquire(&path, entry.identity).unwrap());
+                }
+                let _changed = inspection.inspect_final_contents(&parent, &mut changed_files).unwrap_err();
+                drop(changed_files);
+                let moved_path = dir.path().join("private/moved-original");
+                std::fs::rename(dir.path().join("private/published"), &moved_path).unwrap();
+                let replacement = dir.path().join("private/published");
+                std::fs::create_dir(&replacement).unwrap();
+                for (name, body) in names.iter().zip(bodies) {
+                    std::fs::write(replacement.join(name), body).unwrap();
+                }
+                let mut original_files = BTreeMap::new();
+                for (id, entry) in ids.iter().zip(&entries) {
+                    original_files.insert((*id).to_owned(), ExclusiveFile::acquire(&moved_path.join(entry.name), entry.identity).unwrap());
+                }
+                let replacement_error = inspection.inspect_final_contents(&parent, &mut original_files).unwrap_err();
+                assert!(replacement_error.to_string().contains("final directory identity mismatch"));
+                drop(original_files);
+                drop(inspection);
+                assert_eq!(std::fs::read(&journal_path).unwrap(), original_journal);
             } else {
                 drop(receiver_state);
                 assert!(matches!(control.commit(ID.into(), digest.clone()).await, Err(TransferError::NotReady)));
