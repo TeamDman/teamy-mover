@@ -37,6 +37,23 @@ pub struct LocalDirectTarget {
 }
 
 impl LocalDirectTarget {
+    #[cfg(test)]
+    pub(crate) fn synthetic_loopback(
+        endpoint: SocketAddrV4,
+        server_pin: [u8; 32],
+        client_pin: [u8; 32],
+    ) -> Result<Self> {
+        ensure!(
+            endpoint.ip().is_loopback() && endpoint.port() != 0,
+            "test target must be loopback"
+        );
+        Ok(Self {
+            endpoint,
+            server_pin,
+            client_pin,
+        })
+    }
+
     /// Validate the shape of a locally approved direct target. The caller must
     /// independently establish the authority and integrity of these inputs.
     ///

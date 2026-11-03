@@ -1055,8 +1055,16 @@ mod tests {
         )
         .unwrap();
         let control = fixture.receiver.clone();
-        let error = fixture.receiver.serve_once(&target, &fixture.server).await.unwrap_err();
-        assert!(error.to_string().contains("receiver address or TLS identity"));
+        let error = fixture
+            .receiver
+            .serve_once(&target, &fixture.server)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("receiver address or TLS identity")
+        );
         assert!(!control.started.load(Ordering::Acquire));
         assert_eq!(std::fs::read(&fixture.source).unwrap(), b"hello");
     }
@@ -1166,6 +1174,13 @@ mod tests {
     #[ignore = "manual NTFS production-sender commit RPC probe; synthetic qualification only"]
     async fn qualified_commit_rpc_with_production_sender() {
         protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcProduction)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual synthetic TCP and NTFS test; no live qualification"]
+    async fn qualified_one_shot_receiver_with_loopback_tcp() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcLoopback)
             .await;
     }
 
@@ -1374,6 +1389,7 @@ mod tests {
         Rpc,
         RpcCollision,
         RpcProduction,
+        RpcLoopback,
         RpcDisconnect,
         WrongQualification,
     }
@@ -1471,7 +1487,7 @@ mod tests {
             let journal = TransactionJournal::initialize(journal_file, &approval).unwrap();
             let mut stage = Some(stage);
             let mut parent = Some(parent);
-            let receiver = if matches!(mode, CommitMode::RpcProduction | CommitMode::WrongQualification) {
+            let receiver = if matches!(mode, CommitMode::RpcProduction | CommitMode::RpcLoopback | CommitMode::WrongQualification) {
                 let gate = BlockingIoGate::default();
                 let final_name = if mode == CommitMode::WrongQualification { "wrong" } else { "published" };
                 let qualified = synthetic_publication_qualification(stage.take().unwrap(), parent.take().unwrap(), gate, final_name);
@@ -1490,6 +1506,41 @@ mod tests {
                 Receiver::prepare(StagingPermit(()), journal, &approval, files).await.unwrap()
             };
             let control = receiver.clone();
+            if mode == CommitMode::RpcLoopback {
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let std::net::SocketAddr::V4(address) = reservation.local_addr().unwrap() else { panic!("IPv4 required") };
+                drop(reservation);
+                let (server_pin, client_pin) = server.pins();
+                let target = crate::transfer::proxy::LocalDirectTarget::synthetic_loopback(address, server_pin, client_pin).unwrap();
+                let server_task = tokio::spawn(async move { receiver.serve_once(&target, &server).await });
+                let socket = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match tokio::net::TcpStream::connect(address).await {
+                            Ok(socket) => break socket,
+                            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        }
+                    }
+                }).await.unwrap();
+                let authenticated = client.connect(socket).await.unwrap();
+                let connection = vox_transport::establish_client(authenticated).await.unwrap();
+                let status = crate::transfer::sender::send_approved_and_commit(&connection, raw.as_bytes(), &digest, ID, sources).await.unwrap();
+                assert_eq!(status, TransferState::PublishedDurabilityUnconfirmed);
+                connection.shutdown().unwrap();
+                let server_status = tokio::time::timeout(Duration::from_secs(3), server_task).await.expect("server did not observe connection shutdown").unwrap().unwrap();
+                assert_eq!(server_status, ReceiverSessionOutcome::PublishedDurabilityUnconfirmed);
+                let mut guard = control.state.lock().await;
+                let retained = guard.published_handles.as_mut().unwrap();
+                for ((id, name), body) in ids.iter().zip(names).zip(bodies) {
+                    let _held = std::fs::read(dir.path().join("private/published").join(name)).unwrap_err();
+                    let file = retained.files.get_mut(*id).unwrap().file_mut();
+                    file.seek(SeekFrom::Start(0)).unwrap();
+                    let mut actual = Vec::new();
+                    file.read_to_end(&mut actual).unwrap();
+                    assert_eq!(actual, body);
+                    assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                }
+                return;
+            }
             if mode == CommitMode::RpcDisconnect {
                 let (release, wait) = std::sync::mpsc::channel::<()>();
                 let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
