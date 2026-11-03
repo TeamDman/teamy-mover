@@ -13,7 +13,7 @@ pub mod recovery;
 pub mod sender;
 pub mod session;
 #[cfg(any(windows, target_os = "linux"))]
-mod source;
+pub(crate) mod source;
 pub mod tls;
 #[cfg(windows)]
 pub mod transaction_journal;

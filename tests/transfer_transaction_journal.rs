@@ -150,3 +150,42 @@ fn torn_append_and_wrong_approval_fail_without_repairing_the_journal() {
     let _error = TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 2)).unwrap_err();
     assert_eq!(std::fs::read(&fixture.journal).unwrap(), damaged);
 }
+
+#[test]
+fn claim_survives_reopen_and_partial_file_is_preserved_for_inspection() {
+    let fixture = Fixture::new();
+    let path = fixture.dir.path().join("partial");
+    File::create(&path).unwrap();
+    let file_id = regular_file_identity(&File::open(&path).unwrap()).unwrap();
+    let mut held = ExclusiveFile::acquire(&path, file_id).unwrap();
+    let mut journal =
+        TransactionJournal::initialize(fixture.lock(), &fixture.approval(PIN, 1)).unwrap();
+    journal.claim_empty_file("one", &mut held, 1).unwrap();
+    journal.claim_empty_file("one", &mut held, 1).unwrap();
+    assert!(journal.has_pending_claim("one"));
+    assert!(!journal.has_observation("one"));
+    drop(held);
+    drop(journal);
+
+    std::fs::write(&path, b"he").unwrap();
+    let mut restarted =
+        TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 2)).unwrap();
+    assert!(restarted.has_pending_claim("one"));
+    let mut held = ExclusiveFile::acquire(&path, file_id).unwrap();
+    assert!(restarted.claim_empty_file("one", &mut held, 2).is_err());
+    drop(held);
+    assert_eq!(std::fs::read(&path).unwrap(), b"he");
+    drop(restarted);
+
+    std::fs::write(&path, b"hello").unwrap();
+    let mut restarted =
+        TransactionJournal::reopen(fixture.lock(), &fixture.approval(PIN, 2)).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    restarted.verify_file("one", &mut file, 2).unwrap();
+    assert!(restarted.has_observation("one"));
+    assert!(!restarted.has_pending_claim("one"));
+}

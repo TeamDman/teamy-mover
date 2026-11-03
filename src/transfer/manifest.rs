@@ -11,7 +11,8 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashSet;
 
-const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+/// Maximum accepted canonical manifest size in bytes.
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_FILES: usize = 16;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;

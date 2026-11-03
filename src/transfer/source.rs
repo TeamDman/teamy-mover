@@ -52,7 +52,7 @@ pub(super) fn fingerprint(file: &File) -> Result<Fingerprint> {
 /// symlink, including the final component. O_NONBLOCK prevents FIFO opens from
 /// hanging; fingerprint validation rejects non-regular files and hard links.
 #[cfg(target_os = "linux")]
-pub(super) fn open_linux(path: &std::path::Path) -> Result<File> {
+pub(crate) fn open_linux(path: &std::path::Path) -> Result<File> {
     use rustix::fs::Mode;
     use rustix::fs::OFlags;
     use rustix::fs::openat;

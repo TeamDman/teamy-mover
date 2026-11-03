@@ -1,3 +1,5 @@
+use sha2::Digest;
+use sha2::Sha256;
 use std::process::Command;
 
 #[test]
@@ -14,4 +16,51 @@ fn transfer_placeholders_refuse_to_run_and_do_not_create_files() {
         assert!(output.stdout.is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
+}
+
+#[test]
+fn validate_manifest_checks_local_approval_without_modifying_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    let id = "0123456789abcdef0123456789abcdef";
+    let hash = format!("{:x}", Sha256::digest(b"hello"));
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let raw = format!(
+        r#"{{"aggregate_bytes":5,"expires_unix":{expires},"file_count":1,"files":[{{"id":"one","name":"a.bin","sha256":"{hash}","size":5}}],"transaction_id":"{id}","version":1}}"#
+    );
+    std::fs::write(&path, raw.as_bytes()).unwrap();
+    let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+    let run = |expected: &str| {
+        Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+            .current_dir(dir.path())
+            .args([
+                "--output-format",
+                "json",
+                "transfer",
+                "validate-manifest",
+                "--manifest-file",
+            ])
+            .arg(&path)
+            .args(["--manifest-sha256", expected, "--transaction-id", id])
+            .output()
+            .unwrap()
+    };
+    let good = run(&digest);
+    assert!(
+        good.status.success(),
+        "{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    let output = String::from_utf8(good.stdout).unwrap();
+    assert!(output.contains("\"valid\": true"));
+    assert!(output.contains("\"aggregate_bytes\": 5"));
+    let bad = run(&"0".repeat(64));
+    assert!(!bad.status.success());
+    assert!(bad.stdout.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }

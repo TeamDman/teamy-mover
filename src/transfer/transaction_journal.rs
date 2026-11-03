@@ -44,8 +44,15 @@ struct FileObservation {
 #[repr(u8)]
 enum Event {
     Approved,
+    FileClaimed(FileObservation),
     FileVerified(FileObservation),
     Aborted,
+}
+
+#[derive(Clone)]
+struct FileEntry {
+    observation: FileObservation,
+    verified: bool,
 }
 
 #[derive(Clone, Facet, PartialEq, Eq)]
@@ -68,7 +75,7 @@ pub struct TransactionJournal {
     reserved: [ObjectIdentity; 3],
     records: Vec<u8>,
     sequence: u64,
-    files: BTreeMap<String, FileObservation>,
+    files: BTreeMap<String, FileEntry>,
     aborted: bool,
     poisoned: bool,
 }
@@ -151,7 +158,7 @@ fn apply(
     manifest: &ApprovedManifest,
     stage_volume: u32,
     reserved: &[ObjectIdentity; 3],
-    files: &mut BTreeMap<String, FileObservation>,
+    files: &mut BTreeMap<String, FileEntry>,
     aborted: &mut bool,
     sequence: u64,
 ) -> Result<()> {
@@ -160,7 +167,7 @@ fn apply(
             sequence == 1 && files.is_empty() && !*aborted,
             "invalid initial record"
         ),
-        Event::FileVerified(observation) => {
+        Event::FileClaimed(observation) | Event::FileVerified(observation) => {
             ensure!(sequence > 1 && !*aborted, "invalid file record");
             let file = manifest
                 .files()
@@ -174,12 +181,31 @@ fn apply(
                     && !reserved.contains(&observation.object),
                 "file observation mismatch"
             );
-            ensure!(
-                !files.contains_key(&observation.id)
-                    && !files.values().any(|f| f.object == observation.object),
-                "duplicate file or identity"
-            );
-            files.insert(observation.id.clone(), observation.clone());
+            if let Some(entry) = files.get_mut(&observation.id) {
+                ensure!(
+                    matches!(event, Event::FileVerified(_))
+                        && !entry.verified
+                        && entry.observation == *observation,
+                    "conflicting or duplicate file record"
+                );
+                entry.verified = true;
+            } else {
+                ensure!(
+                    !files
+                        .values()
+                        .any(|f| f.observation.object == observation.object),
+                    "duplicate file identity"
+                );
+                // Legacy v2 verified records without an earlier claim remain
+                // readable but do not authorize restarting a partial file.
+                files.insert(
+                    observation.id.clone(),
+                    FileEntry {
+                        observation: observation.clone(),
+                        verified: matches!(event, Event::FileVerified(_)),
+                    },
+                );
+            }
         }
         Event::Aborted => {
             ensure!(sequence > 1 && !*aborted, "invalid abort");
@@ -351,6 +377,51 @@ impl TransactionJournal {
         Ok(())
     }
 
+    /// Record an empty, exclusively held file before any body is written.
+    /// This records identity only; it does not prove safe staging or permit
+    /// deleting or truncating a partial file after a crash.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe, nonempty, conflicting or expired inputs.
+    pub fn claim_empty_file(&mut self, id: &str, file: &mut ExclusiveFile, now: u64) -> Result<()> {
+        ensure!(
+            !self.poisoned && !self.aborted && now < self.manifest.expires_unix(),
+            "journal unavailable"
+        );
+        self.lock.verify()?;
+        file.verify()?;
+        let approved = self
+            .manifest
+            .files()
+            .find(|f| f.id() == id)
+            .ok_or_else(|| eyre::eyre!("unknown file"))?;
+        let object = identity(file.file_mut())?;
+        ensure!(
+            object.volume_serial == self.stage_volume && !self.reserved.contains(&object),
+            "file identity is outside the approved volume or reserved"
+        );
+        ensure!(
+            file.file_mut().metadata()?.len() == 0,
+            "file is not empty; inspect partial data"
+        );
+        let observation = FileObservation {
+            id: id.to_owned(),
+            object,
+            size: approved.size(),
+            sha256: approved.sha256().to_owned(),
+        };
+        if let Some(existing) = self.files.get(id) {
+            ensure!(
+                !existing.verified && existing.observation == observation,
+                "conflicting file claim"
+            );
+            return Ok(());
+        }
+        file.file_mut().sync_all()?;
+        file.verify()?;
+        self.persist(Event::FileClaimed(observation), now)
+    }
+
     /// Verify a retained file handle's identity, exact length and digest, sync
     /// it, then record its observed identity. A repeat succeeds only for the
     /// same identity after re-verification. This does not establish containment.
@@ -384,7 +455,10 @@ impl TransactionJournal {
             sha256: approved.sha256().to_owned(),
         };
         if let Some(existing) = self.files.get(id) {
-            ensure!(*existing == observation, "conflicting file identity");
+            ensure!(
+                existing.observation == observation,
+                "conflicting file identity"
+            );
         }
         file.seek(SeekFrom::Start(0))?;
         let mut verifier = FileVerifier::new(approved, std::io::sink());
@@ -399,7 +473,7 @@ impl TransactionJournal {
         verifier.finish()?;
         file.sync_all()?;
         ensure!(identity(file)? == object, "file identity changed");
-        if self.files.contains_key(id) {
+        if self.files.get(id).is_some_and(|entry| entry.verified) {
             return Ok(());
         }
         self.persist(Event::FileVerified(observation), now)
@@ -416,7 +490,14 @@ impl TransactionJournal {
     /// Whether the log includes a prior observation, not a current integrity proof.
     #[must_use]
     pub fn has_observation(&self, id: &str) -> bool {
-        self.files.contains_key(id)
+        self.files.get(id).is_some_and(|entry| entry.verified)
+    }
+
+    /// Whether an unverified file identity was recorded before its body.
+    /// A partial file must still be inspected and is never truncated here.
+    #[must_use]
+    pub fn has_pending_claim(&self, id: &str) -> bool {
+        self.files.get(id).is_some_and(|entry| !entry.verified)
     }
 
     /// Publication and receipt generation are deliberately unavailable.
