@@ -6,6 +6,8 @@ pub mod journal;
 pub mod journal_file;
 pub mod manifest;
 pub mod proxy;
+#[cfg(test)]
+mod receiver_model;
 pub mod recovery;
 pub mod session;
 pub mod tls;
