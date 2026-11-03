@@ -17,7 +17,7 @@ pub struct TransferArgs {
 #[facet(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum TransferCommand {
-    /// Sending is not yet available.
+    /// Validate Linux sources; operational sending is not yet available.
     Send(TransferSendArgs),
     /// Receiving is not yet available.
     Receive(TransferReceiveArgs),
@@ -28,12 +28,11 @@ pub enum TransferCommand {
 impl TransferArgs {
     /// # Errors
     /// Returns an error for invalid input or disabled send/receive operations.
-    pub fn invoke(self) -> eyre::Result<CliOutput> {
+    pub async fn invoke(self) -> eyre::Result<CliOutput> {
         match self.command {
             TransferCommand::ValidateManifest(args) => args.invoke(),
-            TransferCommand::Send(_) | TransferCommand::Receive(_) => {
-                Err(eyre::eyre!("transfer is not yet available"))
-            }
+            TransferCommand::Send(args) => args.invoke().await,
+            TransferCommand::Receive(_) => Err(eyre::eyre!("transfer is not yet available")),
         }
     }
 }

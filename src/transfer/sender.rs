@@ -181,12 +181,10 @@ async fn send_one(
     .await?
 }
 
-async fn send_inner(
-    connection: &BoundedConnection,
+async fn prepare_sources(
     manifest: &ApprovedManifest,
-    digest: &str,
     sources: Vec<Source>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, CheckedSource>> {
     check_expiry(manifest)?;
     ensure!(
         sources.len() == manifest.files().len(),
@@ -227,6 +225,16 @@ async fn send_inner(
         );
         check_expiry(manifest)?;
     }
+    Ok(ready)
+}
+
+async fn send_inner(
+    connection: &BoundedConnection,
+    manifest: &ApprovedManifest,
+    digest: &str,
+    sources: Vec<Source>,
+) -> Result<()> {
+    let mut ready = prepare_sources(manifest, sources).await?;
     let client: TransferWireClient =
         tokio::time::timeout(operation_window(manifest)?, connection.open_lane()).await??;
     tokio::time::timeout(
@@ -264,6 +272,27 @@ async fn send_inner(
     Ok(())
 }
 
+/// Validate a locally selected source set against the approved manifest.
+/// This holds each source open while hashing and checking its identity, then
+/// closes the handles. It creates no destination and opens no connection; a
+/// later transfer must reopen and revalidate because sources can change.
+///
+/// # Errors
+/// Rejects expired or mismatched approval, changed sources, duplicate IDs or
+/// identities, missing files, wrong lengths or digests, and I/O timeouts.
+pub async fn verify_approved_sources(
+    manifest_bytes: &[u8],
+    manifest_sha256: &str,
+    transaction_id: &str,
+    sources: Vec<Source>,
+) -> Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let manifest = parse_approved_manifest(manifest_bytes, manifest_sha256, transaction_id, now)?;
+    let _verified =
+        tokio::time::timeout(SESSION_DEADLINE, prepare_sources(&manifest, sources)).await??;
+    Ok(())
+}
+
 /// Stream one locally approved set over a previously authenticated connection.
 /// This function does not attempt commit or source deletion.
 ///
@@ -283,4 +312,66 @@ pub async fn send_prepublication(
         send_inner(connection, &manifest, manifest_sha256, sources),
     )
     .await?
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn local_source_verification_checks_three_files_without_modifying_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodies: [&[u8]; 3] = [b"one", b"two", b"three"];
+        let ids = ["one", "two", "three"];
+        for (id, bytes) in ids.iter().zip(bodies) {
+            std::fs::write(dir.path().join(id), bytes).unwrap();
+        }
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let id = "0123456789abcdef0123456789abcdef";
+        let files = ids
+            .iter()
+            .zip(bodies)
+            .map(|(name, bytes)| {
+                let hash = format!("{:x}", Sha256::digest(bytes));
+                format!(
+                    r#"{{"id":"{name}","name":"{name}.bin","sha256":"{hash}","size":{}}}"#,
+                    bytes.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            r#"{{"aggregate_bytes":11,"expires_unix":{expiry},"file_count":3,"files":[{files}],"transaction_id":"{id}","version":1}}"#
+        );
+        let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+        let sources = || {
+            ids.iter()
+                .map(|id| {
+                    Source::from_file((*id).to_owned(), File::open(dir.path().join(id)).unwrap())
+                })
+                .collect()
+        };
+        verify_approved_sources(raw.as_bytes(), &digest, id, sources())
+            .await
+            .unwrap();
+        assert!(
+            verify_approved_sources(raw.as_bytes(), &"0".repeat(64), id, sources())
+                .await
+                .is_err()
+        );
+        std::fs::write(dir.path().join("two"), b"TWO").unwrap();
+        assert!(
+            verify_approved_sources(raw.as_bytes(), &digest, id, sources())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(dir.path().join("one")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dir.path().join("two")).unwrap(), b"TWO");
+        assert_eq!(std::fs::read(dir.path().join("three")).unwrap(), b"three");
+    }
 }

@@ -80,7 +80,7 @@ impl Command {
         cancellation_scope.bail_if_cancelled()?;
         match self {
             Command::Plan(args) => args.invoke().await,
-            Command::Transfer(args) => args.invoke(),
+            Command::Transfer(args) => args.invoke().await,
         }
     }
 }

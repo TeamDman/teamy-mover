@@ -64,3 +64,77 @@ fn validate_manifest_checks_local_approval_without_modifying_input() {
     assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn send_verify_only_checks_sources_without_sending_or_modifying_them() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let manifest_path = root.join("manifest.json");
+    let map_path = root.join("sources.json");
+    let source_path = root.join("source.bin");
+    let alias_path = root.join("alias.bin");
+    let id = "0123456789abcdef0123456789abcdef";
+    std::fs::write(&source_path, b"hello").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"hello"));
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let manifest = format!(
+        r#"{{"aggregate_bytes":5,"expires_unix":{expires},"file_count":1,"files":[{{"id":"one","name":"a.bin","sha256":"{hash}","size":5}}],"transaction_id":"{id}","version":1}}"#
+    );
+    std::fs::write(&manifest_path, manifest.as_bytes()).unwrap();
+    let digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+    let write_map = |path: &std::path::Path, source_id: &str| {
+        let path = path.to_str().unwrap();
+        assert!(!path.contains(['"', '\\']));
+        std::fs::write(
+            &map_path,
+            format!(r#"{{"version":1,"sources":[{{"id":"{source_id}","path":"{path}"}}]}}"#),
+        )
+        .unwrap();
+    };
+    let run = |digest: &str| {
+        Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+            .args([
+                "--output-format",
+                "json",
+                "transfer",
+                "send",
+                "--verify-only",
+                "--manifest-file",
+            ])
+            .arg(&manifest_path)
+            .args([
+                "--manifest-sha256",
+                digest,
+                "--transaction-id",
+                id,
+                "--source-map",
+            ])
+            .arg(&map_path)
+            .output()
+            .unwrap()
+    };
+    write_map(&source_path, "one");
+    let good = run(&digest);
+    assert!(
+        good.status.success(),
+        "{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert!(String::from_utf8_lossy(&good.stdout).contains("\"verified\": true"));
+    assert!(!run(&"0".repeat(64)).status.success());
+    write_map(&source_path, "wrong");
+    assert!(!run(&digest).status.success());
+    symlink(&source_path, &alias_path).unwrap();
+    write_map(&alias_path, "one");
+    assert!(!run(&digest).status.success());
+    write_map(&source_path, "one");
+    std::fs::write(&source_path, b"HELLO").unwrap();
+    assert!(!run(&digest).status.success());
+    assert_eq!(std::fs::read(&source_path).unwrap(), b"HELLO");
+}

@@ -6,6 +6,31 @@ This initial release is a planner. `plan create`, `plan action add`, and
 `plan action remove` write plan metadata. The other commands read it. No command executes
 moves, cleans caches, removes source files, or creates destination directories.
 
+## Verify transfer sources on Linux
+
+`transfer send --verify-only` checks a locally approved manifest and source
+files without opening a connection or sending anything. Operational transfer
+and receipt commands remain disabled. The input files and source files must use
+absolute paths with no symlink components. Keep the source map private because
+it contains local paths. For example, a source map has this versioned shape:
+
+```json
+{"version":1,"sources":[{"id":"video","path":"/absolute/path/video.mkv"}]}
+```
+
+The IDs must exactly match the approved manifest. Supply the manifest digest and
+transaction ID through your local approval process:
+
+```sh
+teamy-mover transfer send --verify-only --manifest-file /absolute/path/manifest.json \
+  --manifest-sha256 APPROVED_SHA256 --transaction-id APPROVED_TRANSACTION_ID \
+  --source-map /absolute/path/sources.json
+```
+
+The check reads and hashes each file while checking its identity. It does not
+lock a snapshot for a later run; any eventual send must reopen and reverify the
+sources. Windows source verification through this CLI is not yet available.
+
 ## Try the planner
 
 ```powershell
