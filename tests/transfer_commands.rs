@@ -47,7 +47,7 @@ fn sender_limit_check_runs_in_child_without_starting_transfer() {
     assert!(output.contains("\"transfer_started\": false"));
     let combined = run(&["--verify-only"]);
     assert!(!combined.status.success());
-    assert!(combined.stdout.is_empty());
+    assert_eq!(combined.stdout, [0_u8; 0]);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
