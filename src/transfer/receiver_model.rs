@@ -301,7 +301,7 @@ impl Model {
         if self.state.phase == Phase::ReceiptRecorded {
             return self.status(id, digest, pin, now).and_then(|s| match s {
                 Status::Receipt(bytes) => Ok(bytes),
-                _ => bail!("receipt unavailable"),
+                _ => Err(eyre::eyre!("receipt unavailable")),
             });
         }
         ensure!(
