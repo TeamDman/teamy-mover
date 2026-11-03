@@ -280,7 +280,7 @@ async fn send_linux(
         if private {
             let meta = file.metadata()?;
             ensure!(
-                meta.uid() == rustix::process::geteuid().as_raw() && meta.mode() & 0o077 == 0,
+                meta.uid() == rustix::process::geteuid().as_raw() && meta.mode().trailing_zeros() >= 6,
                 "private key must be owned by the current user and inaccessible to group and others"
             );
         }
