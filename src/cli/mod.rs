@@ -58,7 +58,15 @@ impl Cli {
     ///
     /// This function will return an error if the tokio runtime cannot be built or if the command fails.
     pub fn invoke(self, cancellation_scope: CancellationScope) -> eyre::Result<CliOutput> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let direct_sender = matches!(&self.command, Command::Transfer(transfer)
+            if matches!(&transfer.command, transfer::TransferCommand::Send(args)
+                if args.connect_config.is_some() && !args.verify_only));
+        let mut builder = if direct_sender {
+            tokio::runtime::Builder::new_current_thread()
+        } else {
+            tokio::runtime::Builder::new_multi_thread()
+        };
+        let runtime = builder
             .enable_all()
             .build()
             .wrap_err("Failed to build tokio runtime")?;

@@ -51,6 +51,25 @@ fn sender_limit_check_runs_in_child_without_starting_transfer() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_sender_requires_local_approval_before_connecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("connection.json");
+    std::fs::write(&config, b"{}").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_teamy-mover"))
+        .current_dir(dir.path())
+        .args(["transfer", "send", "--connect-config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("manifest file required"));
+    assert!(result.stdout.is_empty());
+    assert_eq!(std::fs::read(&config).unwrap(), b"{}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
 #[cfg(windows)]
 #[test]
 fn receiver_limit_check_never_assigns_or_starts_a_process() {
