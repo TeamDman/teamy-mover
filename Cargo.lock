@@ -1874,6 +1874,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "rustix",
  "rustls",
  "sha2",
  "teamy-cancellation",

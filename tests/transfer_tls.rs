@@ -284,9 +284,9 @@ struct MemoryTransferState {
 #[derive(Clone)]
 struct MemoryTransfer {
     manifest_digest: String,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     manifest_bytes: Vec<u8>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     reject_upload: bool,
     state: std::sync::Arc<tokio::sync::Mutex<MemoryTransferState>>,
 }
@@ -306,9 +306,9 @@ impl MemoryTransfer {
         let manifest = parse_approved_manifest(raw.as_bytes(), &digest, TRANSACTION_ID, 1).unwrap();
         Self {
             manifest_digest: digest,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             manifest_bytes: raw.into_bytes(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             reject_upload: false,
             state: std::sync::Arc::new(tokio::sync::Mutex::new(MemoryTransferState {
                 began: false,
@@ -350,7 +350,7 @@ impl TransferWire for MemoryTransfer {
         if !self.matches(&transaction_id, &manifest_sha256) {
             return Err(TransferError::Rejected);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if self.reject_upload {
             return Err(TransferError::Failed);
         }
@@ -469,7 +469,22 @@ async fn transfer_contract_streams_synthetic_bodies_over_pinned_tls_and_vox() {
     .expect("in-memory transfer contract timed out");
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
+fn test_source(id: &str, path: &std::path::Path) -> teamy_mover::transfer::sender::Source {
+    #[cfg(windows)]
+    {
+        teamy_mover::transfer::sender::Source::from_file(
+            id.into(),
+            std::fs::File::open(path).unwrap(),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        teamy_mover::transfer::sender::Source::open(id.into(), path).unwrap()
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 async fn sender_fixture() -> (
     vox_transport::BoundedConnection,
     vox_transport::BoundedConnection,
@@ -498,10 +513,9 @@ async fn sender_fixture() -> (
     (client_vox.unwrap(), server_vox.unwrap(), service)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
 async fn production_sender_preserves_sources_when_receiver_fails() {
-    use teamy_mover::transfer::sender::Source;
     use teamy_mover::transfer::sender::send_prepublication;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let now = std::time::SystemTime::now()
@@ -532,16 +546,7 @@ async fn production_sender_preserves_sources_when_receiver_fails() {
         let b = dir.path().join("b");
         std::fs::write(&a, b"hello").unwrap();
         std::fs::write(&b, b"world").unwrap();
-        let sources = vec![
-            Source {
-                id: "one".into(),
-                file: std::fs::File::open(&a).unwrap(),
-            },
-            Source {
-                id: "two".into(),
-                file: std::fs::File::open(&b).unwrap(),
-            },
-        ];
+        let sources = vec![test_source("one", &a), test_source("two", &b)];
         assert!(
             send_prepublication(
                 &client_vox,
@@ -560,10 +565,9 @@ async fn production_sender_preserves_sources_when_receiver_fails() {
     .expect("sender failure test timed out");
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
 async fn production_sender_streams_files_over_pinned_tls_without_deleting_sources() {
-    use teamy_mover::transfer::sender::Source;
     use teamy_mover::transfer::sender::send_prepublication;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let (client, _server, service) = sender_fixture().await;
@@ -572,16 +576,7 @@ async fn production_sender_streams_files_over_pinned_tls_without_deleting_source
         let b = dir.path().join("b");
         std::fs::write(&a, b"hello").unwrap();
         std::fs::write(&b, b"world").unwrap();
-        let sources = vec![
-            Source {
-                id: "two".into(),
-                file: std::fs::File::open(&b).unwrap(),
-            },
-            Source {
-                id: "one".into(),
-                file: std::fs::File::open(&a).unwrap(),
-            },
-        ];
+        let sources = vec![test_source("two", &b), test_source("one", &a)];
         send_prepublication(
             &client,
             &service.manifest_bytes,
@@ -599,10 +594,9 @@ async fn production_sender_streams_files_over_pinned_tls_without_deleting_source
     .expect("sender test timed out");
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
 async fn production_sender_rejects_bad_source_before_contacting_receiver() {
-    use teamy_mover::transfer::sender::Source;
     use teamy_mover::transfer::sender::send_prepublication;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let (client, _server, service) = sender_fixture().await;
@@ -611,16 +605,7 @@ async fn production_sender_rejects_bad_source_before_contacting_receiver() {
         let b = dir.path().join("b");
         std::fs::write(&a, b"HELLO").unwrap();
         std::fs::write(&b, b"world").unwrap();
-        let sources = vec![
-            Source {
-                id: "one".into(),
-                file: std::fs::File::open(&a).unwrap(),
-            },
-            Source {
-                id: "two".into(),
-                file: std::fs::File::open(&b).unwrap(),
-            },
-        ];
+        let sources = vec![test_source("one", &a), test_source("two", &b)];
         assert!(
             send_prepublication(
                 &client,

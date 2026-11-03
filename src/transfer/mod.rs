@@ -9,9 +9,11 @@ pub mod proxy;
 #[cfg(test)]
 mod receiver_model;
 pub mod recovery;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub mod sender;
 pub mod session;
+#[cfg(any(windows, target_os = "linux"))]
+mod source;
 pub mod tls;
 #[cfg(windows)]
 pub mod transaction_journal;

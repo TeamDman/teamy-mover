@@ -1,4 +1,4 @@
-//! Bounded sender using already-open Windows source handles.
+//! Bounded sender using approved source handles.
 //!
 //! This sends only to a caller-provided authenticated Vox connection. It does
 //! not open a socket, create credentials, publish a destination or delete a
@@ -8,11 +8,11 @@
 use super::manifest::ApprovedFile;
 use super::manifest::ApprovedManifest;
 use super::manifest::parse_approved_manifest;
+use super::source::Fingerprint;
+use super::source::fingerprint;
 use super::verified_stream::FileVerifier;
 use super::verified_stream::MAX_CHUNK_BYTES;
 use super::vox_transport::BoundedConnection;
-use super::windows_lock::FileIdentity;
-use super::windows_lock::regular_file_identity;
 use super::wire::TransferState;
 use super::wire::TransferWireClient;
 use eyre::Result;
@@ -30,17 +30,38 @@ const OPERATION_DEADLINE: Duration = Duration::from_secs(30);
 const SESSION_DEADLINE: Duration = Duration::from_mins(15);
 
 /// A locally selected source handle and its opaque approved file ID.
-/// Opening and safe selection are the caller's responsibility.
 #[derive(Debug)]
 pub struct Source {
-    pub id: String,
-    pub file: File,
+    id: String,
+    file: File,
+}
+
+impl Source {
+    /// Open an absolute Linux source path without following symlinks.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe paths, links, non-regular files or I/O failure.
+    #[cfg(target_os = "linux")]
+    pub fn open(id: String, path: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            id,
+            file: super::source::open_linux(path)?,
+        })
+    }
+
+    /// Select an already-open Windows handle. Its path ancestry must have been
+    /// independently checked by the caller.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn from_file(id: String, file: File) -> Self {
+        Self { id, file }
+    }
 }
 
 struct CheckedSource {
     id: String,
     file: tokio::fs::File,
-    identity: FileIdentity,
+    identity: Fingerprint,
 }
 
 fn check_expiry(manifest: &ApprovedManifest) -> Result<()> {
@@ -142,8 +163,8 @@ async fn send_one(
         let file =
             tokio::time::timeout(operation_window(manifest)?, source.file.into_std()).await?;
         ensure!(
-            regular_file_identity(&file)? == source.identity,
-            "source identity changed"
+            fingerprint(&file)? == source.identity,
+            "source changed while sending"
         );
         tokio::time::timeout(
             operation_window(manifest)?,
@@ -178,13 +199,19 @@ async fn send_inner(
             .files()
             .find(|f| f.id() == source.id)
             .ok_or_else(|| eyre::eyre!("source is not approved"))?;
-        let identity = regular_file_identity(&source.file)?;
+        let identity = fingerprint(&source.file)?;
         ensure!(
-            identities.insert((identity.volume_serial, identity.file_index)),
+            identities.insert((identity.device, identity.object)),
             "duplicate source identity"
         );
         let mut file = tokio::fs::File::from_std(source.file);
         verify_source(&mut file, approved, manifest).await?;
+        let file = tokio::time::timeout(operation_window(manifest)?, file.into_std()).await?;
+        ensure!(
+            fingerprint(&file)? == identity,
+            "source changed during verification"
+        );
+        let file = tokio::fs::File::from_std(file);
         ensure!(
             ready
                 .insert(
