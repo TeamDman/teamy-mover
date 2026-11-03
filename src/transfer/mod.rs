@@ -25,4 +25,6 @@ pub mod verified_stream;
 pub mod vox_transport;
 #[cfg(windows)]
 pub mod windows_lock;
+#[cfg(windows)]
+pub mod windows_stage;
 pub mod wire;
