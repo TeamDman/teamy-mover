@@ -16,7 +16,9 @@ use super::verified_stream::FileVerifier;
 use super::vox_transport::BoundedConnection;
 use super::vox_transport::{self};
 use super::windows_lock::ExclusiveFile;
-use super::windows_publish::{PublicationQualification, RenameOutcome, RenameResult, commit_qualified_stage};
+use super::windows_publish::{
+    PublicationQualification, RenameOutcome, RenameResult, commit_qualified_stage,
+};
 use super::wire::TransferError;
 use super::wire::TransferState;
 use super::wire::TransferWire;
@@ -98,6 +100,8 @@ struct RetainedPublication {
     _stage: super::windows_acl::CreatedDirectory,
     _parent: std::fs::File,
     _ancestry: Vec<std::fs::File>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "retains exclusive handles"))]
+    files: std::collections::BTreeMap<String, super::windows_lock::ExclusiveFile>,
 }
 
 impl State {
@@ -466,8 +470,12 @@ impl TransferWire for Receiver {
         if !state.begun || state.publication.is_none() || state.journal.is_none() {
             return Err(TransferError::NotReady);
         }
-        let connection = state.authenticated_connection.clone().ok_or(TransferError::NotReady)?;
-        if tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false } {
+        let connection = state
+            .authenticated_connection
+            .clone()
+            .ok_or(TransferError::NotReady)?;
+        if tokio::select! { biased; () = connection.closed() => true, () = std::future::ready(()) => false }
+        {
             return Err(TransferError::NotReady);
         }
         let (budget, _) = worker_budget(&state).map_err(|_error| TransferError::Expired)?;
@@ -481,7 +489,8 @@ impl TransferWire for Receiver {
         let work = async move {
             #[cfg(test)]
             if let Some(hook) = hook {
-                return super::windows_publish::synthetic_commit_with_hook(input, budget, hook).await;
+                return super::windows_publish::synthetic_commit_with_hook(input, budget, hook)
+                    .await;
             }
             commit_qualified_stage(input, budget).await
         };
@@ -490,13 +499,20 @@ impl TransferWire for Receiver {
             () = connection.closed() => return Err(TransferError::PublicationUncertain),
             result = work => result,
         };
-        let RenameResult { outcome, journal, stage, destination_parent, ancestry } =
-            result.map_err(|_error| TransferError::PublicationUncertain)?;
+        let RenameResult {
+            outcome,
+            journal,
+            stage,
+            destination_parent,
+            ancestry,
+            verified_files,
+        } = result.map_err(|_error| TransferError::PublicationUncertain)?;
         state.journal = Some(journal);
         state.published_handles = Some(RetainedPublication {
             _stage: stage,
             _parent: destination_parent,
             _ancestry: ancestry,
+            files: verified_files,
         });
         if outcome != RenameOutcome::RenamedDurabilityUnconfirmed {
             return Err(TransferError::PublicationUncertain);
@@ -872,25 +888,47 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual NTFS coordinated publication probe; synthetic permit only"]
     async fn coordinated_commit_publishes_three_verified_files() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Coordinated).await;
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::Coordinated)
+            .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS coordinated collision probe; synthetic permit only"]
     async fn coordinated_commit_preserves_existing_destination() {
-        protected_three_file_simulation_inner(true, true, None, false, CommitMode::Coordinated).await;
+        protected_three_file_simulation_inner(true, true, None, false, CommitMode::Coordinated)
+            .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS named-stream injection probe; synthetic permit only"]
     async fn stream_added_after_intent_does_not_get_a_receipt() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::NamedStream).await;
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::NamedStream)
+            .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS post-close stream injection probe; receipt gate remains closed"]
     async fn file_stream_added_after_close_does_not_get_a_receipt() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileStreamAfterClose).await;
+        protected_three_file_simulation_inner(
+            true,
+            false,
+            None,
+            false,
+            CommitMode::FileStreamAfterClose,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS post-close content injection probe; synthetic permit only"]
+    async fn file_content_changed_after_close_does_not_get_a_receipt() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileContentAfterClose).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "manual NTFS post-close identity replacement probe; synthetic permit only"]
+    async fn file_replaced_after_close_does_not_get_a_receipt() {
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::FileIdentityAfterClose).await;
     }
 
     #[tokio::test]
@@ -907,7 +945,8 @@ mod tests {
 
     #[tokio::test]
     async fn coordinated_commit_rejects_wrong_target_before_intent() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::WrongTarget).await;
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::WrongTarget)
+            .await;
     }
 
     #[tokio::test]
@@ -919,19 +958,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual NTFS commit RPC collision probe; synthetic qualification only"]
     async fn qualified_commit_rpc_reports_uncertain_collision() {
-        protected_three_file_simulation_inner(true, true, None, false, CommitMode::RpcCollision).await;
+        protected_three_file_simulation_inner(true, true, None, false, CommitMode::RpcCollision)
+            .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS production-sender commit RPC probe; synthetic qualification only"]
     async fn qualified_commit_rpc_with_production_sender() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcProduction).await;
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcProduction)
+            .await;
     }
 
     #[tokio::test]
     #[ignore = "manual NTFS abrupt-disconnect probe; synthetic qualification only"]
     async fn qualified_commit_rpc_disconnect_after_intent_preserves_stage() {
-        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcDisconnect).await;
+        protected_three_file_simulation_inner(true, false, None, false, CommitMode::RpcDisconnect)
+            .await;
     }
 
     #[tokio::test]
@@ -1115,6 +1157,8 @@ mod tests {
         WrongTarget,
         NamedStream,
         FileStreamAfterClose,
+        FileContentAfterClose,
+        FileIdentityAfterClose,
         Rpc,
         RpcCollision,
         RpcProduction,
@@ -1156,7 +1200,8 @@ mod tests {
         };
         use crate::transfer::windows_lock::directory_identity;
         use crate::transfer::windows_publish::{
-            rename_with_permit_and_ancestry, synthetic_commit_after_close_hook, synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
+            rename_with_permit_and_ancestry, synthetic_commit_after_close_hook,
+            synthetic_commit_with_hook, synthetic_delayed_rename, synthetic_permit,
             synthetic_publication_qualification, synthetic_qualified_commit,
         };
         use crate::transfer::windows_stage::{ExpectedEntry, verify_entries};
@@ -1364,8 +1409,15 @@ mod tests {
                     assert_eq!(std::fs::read(dir.path().join("private/published/existing.bin")).unwrap(), b"already here");
                     assert!(control.state.lock().await.journal.as_ref().unwrap().recorded_receipt().is_none());
                 } else {
-                    for (name, body) in names.iter().zip(bodies) {
-                        assert_eq!(std::fs::read(dir.path().join("private/published").join(name)).unwrap(), body);
+                    let mut guard = control.state.lock().await;
+                    let retained = guard.published_handles.as_mut().unwrap();
+                    for ((id, name), body) in ids.iter().zip(names).zip(bodies) {
+                        let _sharing_error = std::fs::read(dir.path().join("private/published").join(name)).unwrap_err();
+                        let file = retained.files.get_mut(*id).unwrap().file_mut();
+                        file.seek(SeekFrom::Start(0)).unwrap();
+                        let mut actual = Vec::new();
+                        file.read_to_end(&mut actual).unwrap();
+                        assert_eq!(actual, body);
                     }
                 }
                 for (id, body) in ids.iter().zip(bodies) {
@@ -1468,6 +1520,25 @@ mod tests {
                     }
                     return;
                 }
+                if matches!(mode, CommitMode::FileContentAfterClose | CommitMode::FileIdentityAfterClose) {
+                    let original = dir.path().join("private/stage/one.bin");
+                    let saved = dir.path().join("private/replaced-one.bin");
+                    let hook = move || {
+                        if mode == CommitMode::FileIdentityAfterClose {
+                            std::fs::rename(&original, saved).unwrap();
+                            std::fs::write(&original, b"one").unwrap();
+                        } else {
+                            std::fs::write(&original, b"ONE").unwrap();
+                        }
+                    };
+                    let result = synthetic_commit_after_close_hook(input, Duration::from_secs(3), hook).await.unwrap();
+                    assert_eq!(result.outcome, RenameOutcome::RenamedRecordUnconfirmed);
+                    assert!(result.journal.recorded_receipt().is_none());
+                    for (id, body) in ids.iter().zip(bodies) {
+                        assert_eq!(std::fs::read(dir.path().join(format!("source-{id}"))).unwrap(), body);
+                    }
+                    return;
+                }
                 if matches!(mode, CommitMode::Timeout | CommitMode::Cancel) {
                     assert!(!collision);
                     let (release, wait) = std::sync::mpsc::channel::<()>();
@@ -1502,7 +1573,7 @@ mod tests {
                     }
                     return;
                 }
-                let result = commit_qualified_stage(input, Duration::from_secs(3)).await.unwrap();
+                let mut result = commit_qualified_stage(input, Duration::from_secs(3)).await.unwrap();
                 if collision {
                     assert!(matches!(result.outcome, RenameOutcome::Unconfirmed { .. }));
                     assert!(result.journal.recorded_receipt().is_none());
@@ -1511,8 +1582,13 @@ mod tests {
                     assert_eq!(result.outcome, RenameOutcome::RenamedDurabilityUnconfirmed);
                     assert!(result.journal.recorded_receipt().unwrap().contains("published-durability-unconfirmed"));
                     assert_eq!(result.ancestry.len(), 1);
-                    for (name, body) in names.iter().zip(bodies) {
-                        assert_eq!(std::fs::read(dir.path().join("private/published").join(name)).unwrap(), body);
+                    for ((id, name), body) in ids.iter().zip(names).zip(bodies) {
+                        let _sharing_error = std::fs::read(dir.path().join("private/published").join(name)).unwrap_err();
+                        let file = result.verified_files.get_mut(*id).unwrap().file_mut();
+                        file.seek(SeekFrom::Start(0)).unwrap();
+                        let mut actual = Vec::new();
+                        file.read_to_end(&mut actual).unwrap();
+                        assert_eq!(actual, body);
                     }
                 }
                 for (id, body) in ids.iter().zip(bodies) {

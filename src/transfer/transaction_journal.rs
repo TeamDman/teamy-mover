@@ -871,6 +871,92 @@ impl TransactionJournal {
         Ok(())
     }
 
+    /// Reopen the renamed directory's exact approved file set by held parent
+    /// handle, then recheck identities, lengths, hashes and streams. This is
+    /// not a publication permit or proof of protected ancestry. The returned
+    /// exclusive handles must stay live through the receipt decision.
+    pub(crate) fn verify_post_rename_files_before(
+        &mut self,
+        stage: &File,
+        deadline: std::time::Instant,
+        gate: &BlockingIoGate,
+    ) -> Result<BTreeMap<String, ExclusiveFile>> {
+        use super::windows_acl::reopen_private_file_no_share;
+        use super::windows_lock::FileIdentity;
+        use super::windows_stage::{ExpectedEntry, verify_entries};
+
+        let expiry = self.manifest.expires_unix();
+        let checkpoint = || -> Result<u64> {
+            gate.ensure_active()?;
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "post-rename deadline expired"
+            );
+            let current = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            ensure!(current < expiry, "approval expired");
+            Ok(current)
+        };
+        checkpoint()?;
+        self.lock.verify()?;
+        ensure!(
+            self.intent_matches_directory(stage)?,
+            "stage identity mismatch"
+        );
+        let stage_id = directory_identity(stage)?;
+        let mut expected = Vec::new();
+        for approved in self.manifest.files() {
+            let recorded = self
+                .files
+                .get(approved.id())
+                .ok_or_else(|| eyre::eyre!("missing observation"))?;
+            ensure!(recorded.verified, "file observation is not verified");
+            expected.push((
+                approved.id().to_owned(),
+                approved.name().to_owned(),
+                approved.size(),
+                FileIdentity {
+                    volume_serial: recorded.observation.object.volume_serial,
+                    file_index: recorded.observation.object.file_index,
+                },
+            ));
+        }
+        ensure!(expected.len() == self.files.len(), "file set mismatch");
+        let entries: Vec<_> = expected
+            .iter()
+            .map(|(_, name, size, identity)| ExpectedEntry {
+                name,
+                identity: *identity,
+                size: *size,
+            })
+            .collect();
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(stage, stage_id)?;
+        checkpoint()?;
+        verify_entries(stage, stage_id, &entries)?;
+        let mut held = BTreeMap::new();
+        for (id, name, _, identity) in &expected {
+            checkpoint()?;
+            let mut file = reopen_private_file_no_share(stage, stage_id, name, *identity)?;
+            checkpoint()?;
+            self.verify_file_inner(id, file.file_mut(), &checkpoint, true)?;
+            checkpoint()?;
+            ensure!(held.insert(id.clone(), file).is_none(), "duplicate file ID");
+        }
+        checkpoint()?;
+        verify_entries(stage, stage_id, &entries)?;
+        checkpoint()?;
+        super::windows_streams::verify_directory_streams(stage, stage_id)?;
+        checkpoint()?;
+        self.lock.verify()?;
+        ensure!(
+            self.intent_matches_directory(stage)?,
+            "stage identity changed"
+        );
+        Ok(held)
+    }
+
     /// The journaled pre-rename identity, if commit intent was recorded.
     /// This is not evidence that a rename took place.
     #[must_use]
@@ -1051,6 +1137,7 @@ impl TransactionJournal {
         &mut self,
         evidence: super::windows_publish::ObservedPublication,
         gate: &BlockingIoGate,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         let operation = (|| {
             ensure!(
@@ -1064,6 +1151,10 @@ impl TransactionJournal {
             );
             let clock = || {
                 gate.ensure_active()?;
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "publication deadline expired"
+                );
                 Ok(std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs())
@@ -1229,7 +1320,11 @@ impl LocalInspection {
         );
         let file_identity = file.identity();
         checkpoint()?;
-        super::windows_streams::verify_file_streams(file.file_mut(), file_identity, approved.size())?;
+        super::windows_streams::verify_file_streams(
+            file.file_mut(),
+            file_identity,
+            approved.size(),
+        )?;
         checkpoint()?;
         file.file_mut().seek(SeekFrom::Start(0))?;
         let mut verifier = FileVerifier::new(approved, std::io::sink());
@@ -1245,7 +1340,11 @@ impl LocalInspection {
         }
         verifier.finish()?;
         checkpoint()?;
-        super::windows_streams::verify_file_streams(file.file_mut(), file_identity, approved.size())?;
+        super::windows_streams::verify_file_streams(
+            file.file_mut(),
+            file_identity,
+            approved.size(),
+        )?;
         checkpoint()?;
         file.verify()?;
         ensure!(

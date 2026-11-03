@@ -16,7 +16,7 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
 };
 use windows::Win32::Foundation::{
-    ERROR_NO_TOKEN, HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    ERROR_NO_TOKEN, HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, STATUS_PENDING, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -925,7 +925,118 @@ pub fn create_private_file(
     }
     // The only handle returned by our FILE_CREATE used share mode zero and has
     // not been duplicated or exposed; transfer ownership to ExclusiveFile.
-    ExclusiveFile::from_created_no_share(file)
+    ExclusiveFile::from_opened_no_share(file)
+}
+
+/// Reopen an expected private regular file relative to a retained directory,
+/// without sharing or following a reparse point. This does not qualify the
+/// directory's ancestry, prove publication, or authorize a receipt.
+///
+/// This must run inside the single-flight worker that owns the journal, lock,
+/// stage, destination and ancestry handles. An unexpected pending open parks
+/// that worker until process termination so its output buffers and all outer
+/// resources remain live; a timeout does not permit retry.
+///
+/// # Errors
+/// Rejects mismatched identities, unsafe ACLs or names, unsupported opens and
+/// competing handles. An unexpected pending open is quarantined, not returned.
+pub(crate) fn reopen_private_file_no_share(
+    parent: &File,
+    expected_parent: FileIdentity,
+    name: &str,
+    expected_file: FileIdentity,
+) -> Result<ExclusiveFile> {
+    ensure!(valid_component(name), "invalid private file component");
+    ensure_not_impersonating()?;
+    let user = process_user_sid()?;
+    ensure!(
+        directory_identity(parent)? == expected_parent,
+        "parent identity mismatch"
+    );
+    ensure!(
+        expected_file.volume_serial == expected_parent.volume_serial,
+        "file volume mismatch"
+    );
+    verify_directory_acl(parent, &user, true)?;
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    let length = u16::try_from(
+        wide.len()
+            .checked_mul(2)
+            .ok_or_else(|| eyre::eyre!("component length overflow"))?,
+    )?;
+    let object_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: windows::core::PWSTR(wide.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>())?,
+        RootDirectory: HANDLE(parent.as_raw_handle()),
+        ObjectName: &raw const object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw = HANDLE::default();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: the worker retains the parent, name, output locations and all
+    // outer transaction resources through this synchronous open. Pending is
+    // handled by parking this same worker without dropping any of them.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut raw,
+            FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status_block,
+            None,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_MODE(0),
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            None,
+            0,
+        )
+    };
+    if status == STATUS_PENDING {
+        loop {
+            std::hint::black_box((
+                wide.as_ptr(),
+                &raw const object_name,
+                &raw const attributes,
+                &raw const raw,
+                &raw const status_block,
+                parent.as_raw_handle(),
+            ));
+            std::thread::park();
+        }
+    }
+    if status.0 != 0 {
+        if !raw.0.is_null() && raw.0 as isize != -1 {
+            // SAFETY: any valid returned handle is uniquely owned here.
+            let _unexpected = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+        }
+        eyre::bail!(
+            "private file reopen failed with NTSTATUS {:#x}",
+            u32::from_ne_bytes(status.0.to_ne_bytes())
+        );
+    }
+    ensure!(
+        !raw.0.is_null() && raw.0 as isize != -1,
+        "invalid reopened file handle"
+    );
+    // SAFETY: a successful open returns a new uniquely owned handle.
+    let file = unsafe { File::from_raw_handle(raw.0) };
+    ensure!(
+        regular_file_identity(&file)? == expected_file,
+        "file identity mismatch"
+    );
+    ensure!(
+        directory_identity(parent)? == expected_parent,
+        "parent identity changed"
+    );
+    inspect_object_acl(&file, &user, true, false)?;
+    verify_directory_acl(parent, &user, true)?;
+    ExclusiveFile::from_opened_no_share(file)
 }
 
 /// Exclusively create one private child directory relative to a retained parent
@@ -1211,9 +1322,8 @@ mod tests {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
             .open(path.join("child"))
             .unwrap();
-        let _conflict =
-            open_checked_child_without_delete_share(&parent, parent_id, "child", false)
-                .unwrap_err();
+        let _conflict = open_checked_child_without_delete_share(&parent, parent_id, "child", false)
+            .unwrap_err();
         drop(delete_handle);
 
         let guarded =
@@ -1223,6 +1333,35 @@ mod tests {
         drop(guarded);
         std::fs::rename(path.join("child"), path.join("moved")).unwrap();
         assert!(path.join("moved").is_dir());
+    }
+
+    #[test]
+    fn private_file_reopen_is_relative_identity_bound_and_exclusive() {
+        use std::io::Read as _;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("private-stage");
+        let stage = create_synthetic_private_directory(&path).unwrap();
+        let stage_id = directory_identity(&stage).unwrap();
+        let mut file = create_private_file(&stage, stage_id, "one.bin").unwrap();
+        file.file_mut().write_all(b"synthetic").unwrap();
+        let expected = file.identity();
+        drop(file);
+
+        let mut held = reopen_private_file_no_share(&stage, stage_id, "one.bin", expected).unwrap();
+        let _conflicting =
+            reopen_private_file_no_share(&stage, stage_id, "one.bin", expected).unwrap_err();
+        let mut contents = Vec::new();
+        held.file_mut().read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"synthetic");
+        drop(held);
+
+        let mut wrong = expected;
+        wrong.file_index ^= 1 << 63;
+        let _wrong = reopen_private_file_no_share(&stage, stage_id, "one.bin", wrong).unwrap_err();
+        let _traversal =
+            reopen_private_file_no_share(&stage, stage_id, "../one.bin", expected).unwrap_err();
+        assert_eq!(std::fs::read(path.join("one.bin")).unwrap(), b"synthetic");
     }
 
     #[test]

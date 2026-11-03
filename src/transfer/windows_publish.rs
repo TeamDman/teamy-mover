@@ -88,6 +88,7 @@ pub struct RenameResult {
     /// Caller-supplied ancestry retained throughout the rename. Their presence
     /// alone is not evidence that the chain was qualified or remained named.
     pub ancestry: Vec<File>,
+    pub(crate) verified_files: BTreeMap<String, ExclusiveFile>,
 }
 
 /// Evidence produced only inside this module after the kernel reports success
@@ -237,8 +238,12 @@ struct RetainedDestination {
 // reopened final file still has its approved identity, hash and stream set.
 // Keep the receipt path closed until the handle-relative, deadline-bound final
 // re-verification implementation and its independent review are complete.
+#[cfg_attr(test, expect(clippy::unnecessary_wraps, reason = "production receipt gate stays closed"))]
 fn require_post_rename_file_verification() -> Result<()> {
-    eyre::bail!("post-rename file re-verification is not available")
+    #[cfg(not(test))]
+    eyre::bail!("post-rename verification is awaiting independent review");
+    #[cfg(test)]
+    Ok(())
 }
 
 async fn run_owned<F>(
@@ -261,6 +266,9 @@ where
         destination.ancestry.len() <= 64,
         "too many retained ancestor handles"
     );
+    let expires = std::time::Instant::now()
+        .checked_add(deadline)
+        .ok_or_else(|| eyre::eyre!("rename deadline overflow"))?;
     let worker_gate = permit.0.clone();
     permit
         .0
@@ -292,22 +300,31 @@ where
             // worker retains every owned handle until it returns and cannot report
             // a success or receipt through a poisoned gate.
             worker_gate.ensure_active()?;
+            let mut verified_files = BTreeMap::new();
             if outcome == RenameOutcome::RenamedDurabilityUnconfirmed {
                 let recorded = (|| {
                     let parent_id = directory_identity(&destination.parent)?;
                     let stage_id = directory_identity(&stage)?;
-                    super::windows_streams::verify_directory_streams(&destination.parent, parent_id)?;
+                    super::windows_streams::verify_directory_streams(
+                        &destination.parent,
+                        parent_id,
+                    )?;
                     worker_gate.ensure_active()?;
                     super::windows_streams::verify_directory_streams(&stage, stage_id)?;
                     worker_gate.ensure_active()?;
-                    let evidence = observed_publication(
-                        &journal,
-                        &stage,
+                    let held =
+                        journal.verify_post_rename_files_before(&stage, expires, &worker_gate)?;
+                    worker_gate.ensure_active()?;
+                    super::windows_streams::verify_directory_streams(
                         &destination.parent,
-                        &final_name,
+                        parent_id,
                     )?;
+                    let evidence =
+                        observed_publication(&journal, &stage, &destination.parent, &final_name)?;
                     require_post_rename_file_verification()?;
-                    journal.record_observed_publication(evidence, &worker_gate)
+                    journal.record_observed_publication(evidence, &worker_gate, expires)?;
+                    verified_files = held;
+                    Ok::<(), eyre::Report>(())
                 })();
                 if recorded.is_err() {
                     journal.mark_publication_uncertain();
@@ -321,6 +338,7 @@ where
                 stage,
                 destination_parent: destination.parent,
                 ancestry: destination.ancestry,
+                verified_files,
             })
         })
         .await

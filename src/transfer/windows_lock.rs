@@ -88,9 +88,9 @@ pub fn directory_identity(file: &File) -> Result<FileIdentity> {
 }
 
 impl ExclusiveFile {
-    /// Wrap a newly created handle. The caller must have opened it with share
+    /// Wrap an owned handle. The caller must have opened it with share
     /// mode zero and must not have duplicated or exposed the handle.
-    pub(crate) fn from_created_no_share(file: File) -> Result<Self> {
+    pub(crate) fn from_opened_no_share(file: File) -> Result<Self> {
         let identity = regular_file_identity(&file)?;
         Ok(Self { file, identity })
     }
