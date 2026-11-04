@@ -321,7 +321,7 @@ async fn run_receiver(validated: ValidatedReceive) -> eyre::Result<crate::cli::o
             state: state.to_owned(),
             source_deletion_attempted: false,
         },
-        Some(Duration::from_secs(30)),
+        Some(Duration::from_mins(15)),
     ))
 }
 

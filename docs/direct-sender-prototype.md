@@ -43,6 +43,15 @@ runtime. A commit failure, timeout or disconnect may leave publication
 uncertain and requires receiver-side inspection. A reported successful
 publication is explicitly durability-unconfirmed.
 
+During an active transfer, informational progress is written to stderr at
+most once every five seconds per file while bytes move. Sender counts mean
+bytes queued locally, not receipt by the peer; receiver counts mean bytes
+written to staging, not a verified or published file. File paths, names,
+contents, and credentials are omitted. A pause in the log does not establish a
+failure, and a transport shutdown request does not prove TLS `close_notify`
+or peer receipt. Use the receiver's verified publication state to assess the
+result; a missing response still requires local reconciliation.
+
 ## Receiver input validation
 
 The Windows command `transfer receive --validate-only --config-file <path>`

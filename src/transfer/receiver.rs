@@ -824,6 +824,17 @@ fn worker_budget(state: &State) -> Result<(Duration, std::time::Instant)> {
     Ok((duration, deadline))
 }
 
+fn report_staged_progress(
+    progress: &mut super::progress::Progress,
+    bytes: usize,
+    total: u64,
+) -> Result<()> {
+    if let Some(bytes_staged) = progress.advance(u64::try_from(bytes)?, std::time::Instant::now()) {
+        tracing::info!(bytes_staged, file_bytes = total, "transfer receiving progress (written to staging)");
+    }
+    Ok(())
+}
+
 async fn receive_body(state: &mut State, id: &str, chunks: &mut vox::Rx<Vec<u8>>) -> Result<()> {
     let completed = state
         .journal
@@ -870,6 +881,7 @@ async fn receive_body(state: &mut State, id: &str, chunks: &mut vox::Rx<Vec<u8>>
     // Check each incoming chunk before passing its bounded bytes to the worker.
     // Completed duplicates are checked against a sink and never overwritten.
     let mut verifier = FileVerifier::new(approved, std::io::sink());
+    let mut progress = super::progress::Progress::new(std::time::Instant::now());
     loop {
         let item = tokio::time::timeout(remaining(state)?, chunks.recv()).await??;
         match item {
@@ -892,6 +904,7 @@ async fn receive_body(state: &mut State, id: &str, chunks: &mut vox::Rx<Vec<u8>>
                         })
                         .await?;
                     state.files.insert(id.to_owned(), file);
+                    report_staged_progress(&mut progress, chunk.get().len(), approved.size())?;
                 }
             }
             None => break,

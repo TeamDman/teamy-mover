@@ -231,7 +231,7 @@ impl TransferSendArgs {
                     state: "published-durability-unconfirmed".to_owned(),
                     source_deletion_attempted: false,
                 },
-                Some(std::time::Duration::from_secs(30)),
+                Some(std::time::Duration::from_mins(15)),
             ));
         }
         verify_approved_sources(&manifest_bytes, &digest, &transaction, sources).await?;

@@ -5,6 +5,8 @@ pub mod blocking_io;
 pub mod journal;
 pub mod journal_file;
 pub mod manifest;
+#[cfg(any(windows, target_os = "linux"))]
+mod progress;
 #[cfg(target_os = "linux")]
 pub mod process_limit;
 pub mod proxy;

@@ -9,6 +9,7 @@
 use super::manifest::ApprovedFile;
 use super::manifest::ApprovedManifest;
 use super::manifest::parse_approved_manifest;
+use super::progress::Progress;
 use super::source::Fingerprint;
 use super::source::fingerprint;
 use super::verified_stream::FileVerifier;
@@ -22,6 +23,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::io::AsyncReadExt;
@@ -118,6 +120,7 @@ async fn send_one(
     transaction: &str,
     digest: &str,
     approved: ApprovedFile<'_>,
+    file_number: usize,
     manifest: &ApprovedManifest,
     mut source: CheckedSource,
 ) -> Result<()> {
@@ -144,6 +147,7 @@ async fn send_one(
     let write = async {
         let mut verifier = FileVerifier::new(approved, std::io::sink());
         let mut buffer = vec![0u8; MAX_CHUNK_BYTES];
+        let mut progress = Progress::new(Instant::now());
         loop {
             check_expiry(manifest)?;
             let count =
@@ -159,6 +163,14 @@ async fn send_one(
                 tx.send(buffer[..count].to_vec()),
             )
             .await??;
+            if let Some(bytes_queued) = progress.advance(u64::try_from(count)?, Instant::now()) {
+                tracing::info!(
+                    file_number,
+                    bytes_queued,
+                    file_bytes = approved.size(),
+                    "transfer sending progress (queued locally)"
+                );
+            }
         }
         verifier.finish()?;
         let file =
@@ -236,6 +248,10 @@ async fn send_inner(
     sources: Vec<Source>,
 ) -> Result<TransferWireClient> {
     let mut ready = prepare_sources(manifest, sources).await?;
+    tracing::info!(
+        file_count = ready.len(),
+        "source files verified; opening transfer lane"
+    );
     let client: TransferWireClient =
         tokio::time::timeout(operation_window(manifest)?, connection.open_lane()).await??;
     tokio::time::timeout(
@@ -244,8 +260,14 @@ async fn send_inner(
     )
     .await?
     .map_err(|_error| eyre::eyre!("receiver rejected begin"))?;
-    for approved in manifest.files() {
+    for (index, approved) in manifest.files().enumerate() {
         check_expiry(manifest)?;
+        let file_number = index + 1;
+        tracing::info!(
+            file_number,
+            file_bytes = approved.size(),
+            "sending approved file"
+        );
         let source = ready
             .remove(approved.id())
             .ok_or_else(|| eyre::eyre!("missing approved source"))?;
@@ -254,10 +276,12 @@ async fn send_inner(
             manifest.transaction_id(),
             digest,
             approved,
+            file_number,
             manifest,
             source,
         )
         .await?;
+        tracing::info!(file_number, "receiver verified file body");
     }
     check_expiry(manifest)?;
     let state = tokio::time::timeout(
@@ -334,6 +358,7 @@ pub async fn send_approved_and_commit(
     let manifest = parse_approved_manifest(manifest_bytes, manifest_sha256, transaction_id, now)?;
     tokio::time::timeout(SESSION_DEADLINE, async {
         let client = send_inner(connection, &manifest, manifest_sha256, sources).await?;
+        tracing::info!("requesting publication");
         tokio::time::timeout(
             operation_window(&manifest)?,
             client.commit(transaction_id.to_owned(), manifest_sha256.to_owned()),
@@ -355,6 +380,7 @@ pub async fn send_approved_and_commit(
             state == TransferState::PublishedDurabilityUnconfirmed,
             "publication state requires inspection"
         );
+        tracing::info!("receiver reported publication; durability unconfirmed");
         Ok(state)
     })
     .await
